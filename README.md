@@ -6,22 +6,23 @@
 
 ## Install
 
-```bash
-# Build
-cd collab-cli && cargo build --release
-```
-
 **Linux/Mac:**
 ```bash
+cd collab-cli && cargo build --release
 mkdir -p ~/bin
 cp target/release/collab ~/bin/
 ```
 
 **Windows:**
 ```powershell
+cd collab-cli; cargo build --release
 mkdir -Force "$env:USERPROFILE\bin"
 copy target\release\collab.exe "$env:USERPROFILE\bin\"
 ```
+
+Or just run the build script:
+- **Linux/Mac:** `./build.sh`
+- **Windows:** `.\build.ps1`
 
 Add to `~/.zshrc` or `~/.bashrc` (Linux/Mac):
 ```bash
@@ -40,8 +41,15 @@ $env:COLLAB_SERVER = "http://kali:8000"
 ## Server
 
 **Start once:**
+
+Linux/Mac:
 ```bash
 cd collab-server && cargo run --release
+```
+
+Windows:
+```powershell
+cd collab-server; cargo run --release
 ```
 
 The server creates `collab.db` and listens on port 8000. All workers connect to this one server.
