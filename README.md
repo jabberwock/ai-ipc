@@ -97,6 +97,24 @@ This heartbeats your presence to the server so others can see you in `collab ros
 
 ---
 
+## Wiring into Claude Code (CLAUDE.md)
+
+Add this to your project's `CLAUDE.md` so each Claude Code worker starts watching automatically:
+
+```markdown
+## Collaboration
+
+At the start of every session, run:
+collab watch --role "brief description of what this worker does"
+
+This registers you on the roster and watches for messages from other workers.
+Check `collab roster` to see who else is online before starting work.
+```
+
+Each worker's `~/.collab.toml` should already have their `instance` name and `recipients` configured — Claude Code will pick that up automatically.
+
+---
+
 ## Commands
 
 ```bash
