@@ -1,9 +1,44 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+// ── Read-state persistence ────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ReadState {
+    /// instance_id → timestamp of the newest message seen in the last `list` run
+    last_read: HashMap<String, DateTime<Utc>>,
+}
+
+fn state_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE").ok().map(PathBuf::from);
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    home.map(|h| h.join(".collab_state.toml"))
+}
+
+fn load_read_state() -> ReadState {
+    state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_read_state(state: &ReadState) {
+    if let Some(path) = state_path() {
+        if let Ok(s) = toml::to_string(state) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+}
+
+// ── Domain types ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub hash: String,
@@ -14,7 +49,7 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInfo {
     pub instance_id: String,
     pub role: String,
@@ -61,7 +96,7 @@ impl CollabClient {
         Ok(())
     }
 
-    pub async fn list_messages(&self) -> Result<()> {
+    pub async fn list_messages(&self, unread_only: bool) -> Result<()> {
         let url = format!("{}/messages/{}", self.base_url, self.instance_id);
 
         let response = self.auth(self.client.get(&url)).send().await?;
@@ -70,15 +105,37 @@ impl CollabClient {
             anyhow::bail!("Failed to fetch messages: {}", response.status());
         }
 
-        let messages: Vec<Message> = response.json().await?;
+        let mut messages: Vec<Message> = response.json().await?;
+
+        let mut state = load_read_state();
+        let last_read = state.last_read.get(&self.instance_id).copied();
+
+        if unread_only {
+            if let Some(since) = last_read {
+                messages.retain(|m| m.timestamp > since);
+            }
+        }
+
+        // Update last_read to the newest message timestamp seen
+        if let Some(newest) = messages.iter().map(|m| m.timestamp).max() {
+            let current = last_read.unwrap_or(DateTime::<Utc>::MIN_UTC);
+            if newest > current {
+                state.last_read.insert(self.instance_id.clone(), newest);
+                save_read_state(&state);
+            }
+        }
 
         if messages.is_empty() {
-            println!("No messages in the last hour.");
+            if unread_only {
+                println!("No unread messages.");
+            } else {
+                println!("No messages in the last hour.");
+            }
             return Ok(());
         }
 
         println!("Messages for @{}:\n", self.instance_id);
-        for msg in messages {
+        for msg in &messages {
             println!("─────────────────────────────────────");
             println!("Hash: {}", &msg.hash[..7]);
             println!("From: @{}", msg.sender);

@@ -1,190 +1,936 @@
 use anyhow::Result;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    buffer::Buffer,
+    layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
-    Terminal,
 };
-use std::io;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
+use textual_rs::{
+    event::keybinding::KeyBinding,
+    widget::{context::AppContext, EventPropagation, WidgetId},
+    App, ModalScreen, Widget, WorkerResult,
+};
 
 use crate::client::{CollabClient, Message, WorkerInfo};
 
-pub async fn run(server: &str, instance_id: &str, interval_secs: u64, token: Option<&str>) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+type FetchData = (Vec<WorkerInfo>, Vec<Message>);
 
-    let client = CollabClient::new(server, instance_id, token);
-    let mut last_refresh = Instant::now() - Duration::from_secs(interval_secs + 1);
-    let mut workers: Vec<WorkerInfo> = vec![];
-    let mut messages: Vec<Message> = vec![];
-    let mut error: Option<String> = None;
+// ── CSS ───────────────────────────────────────────────────────────────────────
+const CSS: &str = r#"
+MonitorScreen {
+    background: $background;
+    color: $foreground;
+}
+MessageModal {
+    background: $background;
+    color: $foreground;
+    height: 100%;
+    width: 100%;
+}
+"#;
 
-    loop {
-        // Refresh data
-        if Instant::now().checked_duration_since(last_refresh).unwrap_or_default() >= Duration::from_secs(interval_secs) {
-            match fetch_all(&client, instance_id).await {
-                Ok((mut w, m)) => {
-                    w.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
-                    workers = w;
-                    messages = m;
-                    error = None;
-                }
-                Err(e) => {
-                    error = Some(e.to_string());
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+pub fn run(server: &str, instance_id: &str, interval_secs: u64, token: Option<&str>) -> Result<()> {
+    let server = server.to_string();
+    let instance_id = instance_id.to_string();
+    let token = token.map(str::to_string);
+    App::new(move || {
+        Box::new(MonitorScreen::new(server, instance_id, interval_secs, token))
+    })
+    .with_css(CSS)
+    .run()
+}
+
+// ── Fetch helper (runs inside worker future) ──────────────────────────────────
+
+async fn fetch_data(server: String, instance_id: String, token: Option<String>) -> Result<FetchData, String> {
+    let client = CollabClient::new(&server, &instance_id, token.as_deref());
+    let (workers_r, messages_r) = tokio::join!(
+        client.fetch_roster_pub(),
+        client.fetch_history_pub(&instance_id),
+    );
+    match (workers_r, messages_r) {
+        (Ok(mut workers), Ok(messages)) => {
+            workers.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+            Ok((workers, messages))
+        }
+        (Err(e), _) => Err(e.to_string()),
+        (_, Err(e)) => Err(e.to_string()),
+    }
+}
+
+// ── MonitorScreen ─────────────────────────────────────────────────────────────
+
+struct MonitorScreen {
+    server: String,
+    instance_id: String,
+    interval_secs: u64,
+    token: Option<String>,
+    workers: RefCell<Vec<WorkerInfo>>,
+    messages: RefCell<Vec<Message>>,
+    /// Cursor in *display* order (0 = newest message).
+    msg_cursor: Cell<usize>,
+    /// Scroll offset in display order.
+    msg_scroll: Cell<usize>,
+    error: RefCell<Option<String>>,
+    own_id: Cell<Option<WidgetId>>,
+    /// Y of the first message data row; updated each render for click hit-testing.
+    msg_data_start_y: Cell<u16>,
+    /// When to next auto-fetch; None means fetch immediately on first render.
+    next_fetch_at: Cell<Option<Instant>>,
+    /// Tracks last click (time + display index) for double-click detection.
+    last_click: RefCell<Option<(Instant, usize)>>,
+}
+
+impl MonitorScreen {
+    fn new(server: String, instance_id: String, interval_secs: u64, token: Option<String>) -> Self {
+        Self {
+            server,
+            instance_id,
+            interval_secs,
+            token,
+            workers: RefCell::new(vec![]),
+            messages: RefCell::new(vec![]),
+            msg_cursor: Cell::new(0),
+            msg_scroll: Cell::new(0),
+            error: RefCell::new(None),
+            own_id: Cell::new(None),
+            msg_data_start_y: Cell::new(0),
+            next_fetch_at: Cell::new(None),
+            last_click: RefCell::new(None),
+        }
+    }
+
+    fn spawn_fetch_now(&self, ctx: &AppContext) {
+        let Some(id) = self.own_id.get() else { return };
+        let server = self.server.clone();
+        let instance_id = self.instance_id.clone();
+        let token = self.token.clone();
+        // Schedule next auto-fetch from now
+        self.next_fetch_at
+            .set(Some(Instant::now() + Duration::from_secs(self.interval_secs)));
+        ctx.run_worker(id, async move {
+            fetch_data(server, instance_id, token).await
+        });
+    }
+
+    fn clamp_scroll(&self, viewport_rows: usize) {
+        let cursor = self.msg_cursor.get();
+        let scroll = self.msg_scroll.get();
+        if cursor < scroll {
+            self.msg_scroll.set(cursor);
+        } else if viewport_rows > 0 && cursor >= scroll + viewport_rows {
+            self.msg_scroll.set(cursor + 1 - viewport_rows);
+        }
+    }
+
+    fn open_modal(&self, ctx: &AppContext) {
+        let messages = self.messages.borrow();
+        let len = messages.len();
+        if len == 0 {
+            return;
+        }
+        let cursor = self.msg_cursor.get();
+        // cursor 0 = newest = messages[len-1]
+        let vec_idx = len.saturating_sub(1 + cursor);
+        if vec_idx >= len {
+            return;
+        }
+        let msg = messages[vec_idx].clone();
+        drop(messages);
+        let dialog = MessageModal::new(msg, self.instance_id.clone());
+        ctx.push_screen_deferred(Box::new(ModalScreen::new(Box::new(dialog))));
+    }
+}
+
+static MONITOR_BINDINGS: &[KeyBinding] = &[
+    KeyBinding {
+        key: KeyCode::Char('q'),
+        modifiers: KeyModifiers::NONE,
+        action: "quit",
+        description: "Quit",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        action: "quit",
+        description: "Quit",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('r'),
+        modifiers: KeyModifiers::NONE,
+        action: "refresh",
+        description: "Refresh",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        action: "cursor_up",
+        description: "Up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('k'),
+        modifiers: KeyModifiers::NONE,
+        action: "cursor_up",
+        description: "Up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        action: "cursor_down",
+        description: "Down",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('j'),
+        modifiers: KeyModifiers::NONE,
+        action: "cursor_down",
+        description: "Down",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        action: "view_message",
+        description: "View",
+        show: true,
+    },
+];
+
+impl Widget for MonitorScreen {
+    fn widget_type_name(&self) -> &'static str {
+        "MonitorScreen"
+    }
+
+    fn can_focus(&self) -> bool {
+        true
+    }
+
+    fn on_mount(&self, id: WidgetId) {
+        self.own_id.set(Some(id));
+    }
+
+    fn on_unmount(&self, _: WidgetId) {
+        self.own_id.set(None);
+    }
+
+    fn key_bindings(&self) -> &[KeyBinding] {
+        MONITOR_BINDINGS
+    }
+
+    fn on_action(&self, action: &str, ctx: &AppContext) {
+        match action {
+            "quit" => ctx.quit(),
+            "refresh" => self.spawn_fetch_now(ctx),
+            "cursor_up" => {
+                let cur = self.msg_cursor.get();
+                if cur > 0 {
+                    self.msg_cursor.set(cur - 1);
                 }
             }
-            last_refresh = Instant::now();
+            "cursor_down" => {
+                let len = self.messages.borrow().len();
+                let cur = self.msg_cursor.get();
+                if len > 0 && cur + 1 < len {
+                    self.msg_cursor.set(cur + 1);
+                }
+            }
+            "view_message" => self.open_modal(ctx),
+            _ => {}
+        }
+    }
+
+    fn on_event(&self, event: &dyn std::any::Any, ctx: &AppContext) -> EventPropagation {
+        // Worker result
+        if let Some(result) = event.downcast_ref::<WorkerResult<Result<FetchData, String>>>() {
+            match &result.value {
+                Ok((workers, messages)) => {
+                    *self.workers.borrow_mut() = workers.clone();
+                    *self.messages.borrow_mut() = messages.clone();
+                    *self.error.borrow_mut() = None;
+                    let len = messages.len();
+                    let cursor = self.msg_cursor.get();
+                    if len > 0 && cursor >= len {
+                        self.msg_cursor.set(len - 1);
+                    }
+                }
+                Err(e) => {
+                    *self.error.borrow_mut() = Some(e.clone());
+                }
+            }
+            return EventPropagation::Stop;
         }
 
-        // Draw
-        terminal.draw(|f| {
-            let area = f.area();
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),   // header
-                    Constraint::Min(6),      // roster
-                    Constraint::Min(8),      // messages
-                    Constraint::Length(1),   // footer
-                ])
-                .split(area);
-
-            // Header
-            let header = Paragraph::new(Line::from(vec![
-                Span::styled(" collab monitor ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw(format!("  @{}  ", instance_id)),
-                Span::styled(
-                    format!("server: {}", server),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-            f.render_widget(header, chunks[0]);
-
-            // Roster table
-            let roster_rows: Vec<Row> = workers.iter().map(|w| {
-                let you = if w.instance_id == instance_id { " ◀" } else { "" };
-                let age = {
-                    let secs = chrono::Utc::now()
-                        .signed_duration_since(w.last_seen)
-                        .num_seconds();
-                    if secs < 60 { format!("{}s ago", secs) }
-                    else { format!("{}m ago", secs / 60) }
-                };
-                let name_style = if w.instance_id == instance_id {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Green)
-                };
-                Row::new(vec![
-                    Cell::from(format!("@{}{}", w.instance_id, you)).style(name_style),
-                    Cell::from(if w.role.is_empty() { "—".to_string() } else { w.role.clone() })
-                        .style(Style::default().fg(Color::White)),
-                    Cell::from(age).style(Style::default().fg(Color::DarkGray)),
-                    Cell::from(if w.message_count > 0 { format!("{} msgs", w.message_count) } else { String::new() })
-                        .style(Style::default().fg(Color::DarkGray)),
-                ])
-            }).collect();
-
-            let roster_title = format!(" Roster ({} online) ", workers.len());
-            let roster = Table::new(
-                roster_rows,
-                [
-                    Constraint::Length(20),
-                    Constraint::Min(30),
-                    Constraint::Length(10),
-                    Constraint::Length(10),
-                ],
-            )
-            .block(Block::default().borders(Borders::ALL).title(roster_title))
-            .header(Row::new(vec!["Worker", "Role", "Last Seen", "Activity"])
-                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)));
-            f.render_widget(roster, chunks[1]);
-
-            // Messages panel
-            let msg_lines: Vec<Line> = if messages.is_empty() {
-                vec![Line::from(Span::styled("  No messages in the last hour.", Style::default().fg(Color::DarkGray)))]
-            } else {
-                messages.iter().rev().take(20).map(|m| {
-                    let direction = if m.recipient == instance_id {
-                        Span::styled(format!("@{} → you", m.sender), Style::default().fg(Color::Yellow))
-                    } else {
-                        Span::styled(format!("you → @{}", m.recipient), Style::default().fg(Color::Cyan))
-                    };
-                    let time = Span::styled(
-                        format!("  {}", m.timestamp.format("%H:%M:%S")),
-                        Style::default().fg(Color::DarkGray),
-                    );
-                    let content = Span::raw(format!("  {}", truncate(&m.content, 60)));
-                    Line::from(vec![direction, time, content])
-                }).collect()
-            };
-
-            let msg_count = messages.len();
-            let messages_widget = Paragraph::new(msg_lines)
-                .block(Block::default().borders(Borders::ALL)
-                    .title(format!(" Messages ({} in last hour) ", msg_count)));
-            f.render_widget(messages_widget, chunks[2]);
-
-            // Footer
-            let elapsed = Instant::now().checked_duration_since(last_refresh).unwrap_or_default().as_secs();
-            let next_refresh = interval_secs.saturating_sub(elapsed);
-            let status = if let Some(ref e) = error {
-                format!(" Error: {} ", e)
-            } else {
-                format!(" Refreshing in {}s  |  q to quit ", next_refresh)
-            };
-            let footer_style = if error.is_some() {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            f.render_widget(Paragraph::new(status).style(footer_style), chunks[3]);
-        })?;
-
-        // Input — non-blocking with short timeout
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('r') => {
-                            // Force refresh
-                            last_refresh = Instant::now() - Duration::from_secs(interval_secs + 1);
+        // Mouse click → move cursor to clicked row; double-click opens modal
+        if let Some(m) = event.downcast_ref::<MouseEvent>() {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let data_y = self.msg_data_start_y.get();
+                if data_y > 0 && m.row >= data_y {
+                    let display_idx = self.msg_scroll.get() + (m.row - data_y) as usize;
+                    let len = self.messages.borrow().len();
+                    if display_idx < len {
+                        let now = Instant::now();
+                        let is_double = self
+                            .last_click
+                            .borrow()
+                            .as_ref()
+                            .map(|(t, row)| *row == display_idx && now.duration_since(*t).as_millis() < 400)
+                            .unwrap_or(false);
+                        *self.last_click.borrow_mut() = Some((now, display_idx));
+                        self.msg_cursor.set(display_idx);
+                        if is_double {
+                            self.open_modal(ctx);
                         }
-                        _ => {}
+                        return EventPropagation::Stop;
                     }
                 }
             }
         }
+
+        EventPropagation::Continue
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    Ok(())
+    fn render(&self, ctx: &AppContext, area: Rect, buf: &mut Buffer) {
+        // Trigger fetch on first render (next_fetch_at = None) or when interval has elapsed.
+        let should_fetch = self
+            .next_fetch_at
+            .get()
+            .map(|t| Instant::now() >= t)
+            .unwrap_or(true);
+        if should_fetch {
+            self.spawn_fetch_now(ctx);
+        }
+        if area.height < 4 {
+            return;
+        }
+
+        let workers = self.workers.borrow();
+        let messages = self.messages.borrow();
+        let error = self.error.borrow();
+        let cursor = self.msg_cursor.get();
+        let w = area.width as usize;
+
+        // ── Layout ────────────────────────────────────────────────────────────
+        let header_y = area.y;
+        let footer_y = area.y + area.height - 1;
+        let content_start = area.y + 1;
+        let content_h = area.height.saturating_sub(2);
+
+        // Roster: title(1) + header(1) + sep(1) + data rows
+        let roster_data_visible = (workers.len() as u16).min(content_h.saturating_sub(6).max(2));
+        let roster_total = 3 + roster_data_visible;
+
+        // Messages: remainder
+        let msg_panel_y = content_start + roster_total;
+        let msg_panel_h = content_h.saturating_sub(roster_total);
+        let msg_data_rows = msg_panel_h.saturating_sub(3) as usize; // title+header+sep
+
+        // ── Column widths ──────────────────────────────────────────────────────
+        // Roster full row: "  " + Worker(18) + " │ " + Role(flex) + " │ " + LastSeen(10) + " │ " + Activity(8)
+        //   fixed = 2 + 18 + 3 + 3 + 10 + 3 + 8 = 47
+        const WORKER_W: usize = 18;
+        const LAST_SEEN_W: usize = 10;
+        const ACTIVITY_W: usize = 8;
+        let roster_fixed = 2 + WORKER_W + 3 + 3 + LAST_SEEN_W + 3 + ACTIVITY_W;
+        let role_w = w.saturating_sub(roster_fixed).max(8);
+
+        // Messages full row: "  " + Direction(dir_w) + " │ " + Time(8) + " │ " + Content(flex)
+        //   fixed = 2 + dir_w + 3 + 8 + 3 = dir_w + 16
+        let max_name = messages
+            .iter()
+            .flat_map(|m| [m.sender.len(), m.recipient.len()])
+            .max()
+            .unwrap_or(0)
+            .max(self.instance_id.len());
+        let dir_w = (max_name + 8).max(16).min(30);
+        let msg_fixed = dir_w + 16;
+        let content_w = w.saturating_sub(msg_fixed).max(10);
+
+        // Adjust scroll so cursor stays in view
+        self.clamp_scroll(msg_data_rows);
+        let scroll = self.msg_scroll.get();
+
+        // ── Header ────────────────────────────────────────────────────────────
+        let h_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        fill_line(buf, area.x, header_y, area.width, h_style);
+        let header_text = format!(
+            " collab monitor  @{}  {}",
+            self.instance_id, self.server
+        );
+        buf.set_string(area.x, header_y, &clip(&header_text, w), h_style);
+
+        // ── Roster panel ──────────────────────────────────────────────────────
+        let dim = Style::default().fg(Color::DarkGray);
+        let sep_style = Style::default().fg(Color::Rgb(60, 60, 90));
+
+        // Title bar
+        let r_title = format!("─ Roster ({} online) ", workers.len());
+        let r_line = format!("{}{}", r_title, "─".repeat(w.saturating_sub(r_title.len())));
+        buf.set_string(area.x, content_start, &clip(&r_line, w), dim);
+
+        // Column headers
+        let r_head = format!(
+            "  {:<w0$} │ {:<w1$} │ {:<w2$} │ {:<w3$}",
+            "Worker", "Role", "Last Seen", "Activity",
+            w0 = WORKER_W, w1 = role_w, w2 = LAST_SEEN_W, w3 = ACTIVITY_W
+        );
+        buf.set_string(
+            area.x,
+            content_start + 1,
+            &clip(&r_head, w),
+            dim.add_modifier(Modifier::BOLD),
+        );
+
+        // Separator
+        let r_sep = format!(
+            "  {}─┼─{}─┼─{}─┼─{}",
+            "─".repeat(WORKER_W),
+            "─".repeat(role_w),
+            "─".repeat(LAST_SEEN_W),
+            "─".repeat(ACTIVITY_W),
+        );
+        buf.set_string(area.x, content_start + 2, &clip(&r_sep, w), sep_style);
+
+        // Worker rows
+        for (i, worker) in workers.iter().enumerate().take(roster_data_visible as usize) {
+            let y = content_start + 3 + i as u16;
+            let you = if worker.instance_id == self.instance_id { " ◀" } else { "" };
+            let name = format!("@{}{}", worker.instance_id, you);
+            let role = if worker.role.is_empty() {
+                "—".to_string()
+            } else {
+                worker.role.clone()
+            };
+            let age = age_str(worker.last_seen);
+            let activity = if worker.message_count > 0 {
+                format!("{} msgs", worker.message_count)
+            } else {
+                String::new()
+            };
+
+            let name_style = if worker.instance_id == self.instance_id {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+
+            let mut cx = area.x;
+            buf.set_string(cx, y, "  ", Style::default());
+            cx += 2;
+            buf.set_string(cx, y, &pad(&name, WORKER_W), name_style);
+            cx += WORKER_W as u16;
+            buf.set_string(cx, y, " │ ", sep_style);
+            cx += 3;
+            buf.set_string(cx, y, &pad(&clip(&role, role_w), role_w), Style::default().fg(Color::White));
+            cx += role_w as u16;
+            buf.set_string(cx, y, " │ ", sep_style);
+            cx += 3;
+            buf.set_string(cx, y, &pad(&clip(&age, LAST_SEEN_W), LAST_SEEN_W), dim);
+            cx += LAST_SEEN_W as u16;
+            buf.set_string(cx, y, " │ ", sep_style);
+            cx += 3;
+            buf.set_string(cx, y, &pad(&clip(&activity, ACTIVITY_W), ACTIVITY_W), dim);
+        }
+
+        // ── Messages panel ────────────────────────────────────────────────────
+        let m_title = format!("─ Messages ({} in last hour) ", messages.len());
+        let m_line = format!("{}{}", m_title, "─".repeat(w.saturating_sub(m_title.len())));
+        buf.set_string(area.x, msg_panel_y, &clip(&m_line, w), dim);
+
+        // Column headers
+        let m_head = format!(
+            "  {:<w1$} │ {:<8} │ {:<w2$}",
+            "Direction",
+            "Time",
+            "Content",
+            w1 = dir_w,
+            w2 = content_w
+        );
+        buf.set_string(
+            area.x,
+            msg_panel_y + 1,
+            &clip(&m_head, w),
+            dim.add_modifier(Modifier::BOLD),
+        );
+
+        // Separator
+        let m_sep = format!(
+            "  {}─┼─{}─┼─{}",
+            "─".repeat(dir_w),
+            "─".repeat(8),
+            "─".repeat(content_w),
+        );
+        buf.set_string(area.x, msg_panel_y + 2, &clip(&m_sep, w), sep_style);
+
+        // Record data start Y for click hit-testing
+        self.msg_data_start_y.set(msg_panel_y + 3);
+
+        // Message rows — display newest first
+        let msg_count = messages.len();
+        for row_offset in 0..msg_data_rows {
+            let display_idx = scroll + row_offset;
+            if display_idx >= msg_count {
+                break;
+            }
+            let vec_idx = msg_count - 1 - display_idx;
+            let msg = &messages[vec_idx];
+            let y = msg_panel_y + 3 + row_offset as u16;
+            let is_cursor = display_idx == cursor;
+
+            let direction = if msg.recipient == self.instance_id {
+                format!("@{} → you", msg.sender)
+            } else {
+                format!("you → @{}", msg.recipient)
+            };
+            let time_str = msg.timestamp.format("%H:%M:%S").to_string();
+            let content_str = clip_no_ellipsis(&msg.content, content_w);
+
+            // Cursor row gets a highlighted background
+            if is_cursor {
+                buf.set_style(
+                    Rect::new(area.x, y, area.width, 1),
+                    Style::default().bg(Color::Rgb(20, 35, 55)),
+                );
+            }
+
+            let dir_style = if is_cursor {
+                Style::default()
+                    .fg(Color::Rgb(0, 255, 163))
+                    .add_modifier(Modifier::BOLD)
+            } else if msg.recipient == self.instance_id {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            let time_style = if is_cursor {
+                Style::default().fg(Color::Rgb(0, 255, 163))
+            } else {
+                dim
+            };
+            let content_style = if is_cursor {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let mut cx = area.x;
+            buf.set_string(cx, y, "  ", Style::default());
+            cx += 2;
+            buf.set_string(cx, y, &pad(&clip(&direction, dir_w), dir_w), dir_style);
+            cx += dir_w as u16;
+            buf.set_string(cx, y, " │ ", sep_style);
+            cx += 3;
+            buf.set_string(cx, y, &pad(&time_str, 8), time_style);
+            cx += 8;
+            buf.set_string(cx, y, " │ ", sep_style);
+            cx += 3;
+            buf.set_string(cx, y, &content_str, content_style);
+        }
+
+        // ── Footer ────────────────────────────────────────────────────────────
+        fill_line(buf, area.x, footer_y, area.width, dim);
+        let footer_text = if let Some(ref e) = *error {
+            format!(" Error: {}", e)
+        } else {
+            format!(
+                " ↑↓ Navigate  │  Enter View  │  r Refresh  │  q Quit"
+            )
+        };
+        let footer_style = if error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            dim
+        };
+        buf.set_string(area.x, footer_y, &clip(&footer_text, w), footer_style);
+
+        drop(workers);
+        drop(messages);
+        drop(error);
+    }
 }
 
-async fn fetch_all(client: &CollabClient, instance_id: &str) -> Result<(Vec<WorkerInfo>, Vec<Message>)> {
-    let workers = client.fetch_roster_pub().await?;
-    let messages = client.fetch_history_pub(instance_id).await?;
-    Ok((workers, messages))
+// ── MessageModal ──────────────────────────────────────────────────────────────
+
+struct MessageModal {
+    msg: Message,
+    instance_id: String,
+    own_id: Cell<Option<WidgetId>>,
+    scroll: Cell<usize>,
+    /// Total wrapped content lines; updated each render for scroll clamping.
+    total_lines: Cell<usize>,
+    /// Visible content rows; updated each render.
+    visible_rows: Cell<usize>,
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
+impl MessageModal {
+    fn new(msg: Message, instance_id: String) -> Self {
+        Self {
+            msg,
+            instance_id,
+            own_id: Cell::new(None),
+            scroll: Cell::new(0),
+            total_lines: Cell::new(0),
+            visible_rows: Cell::new(0),
+        }
+    }
+
+    fn scroll_up(&self) {
+        let s = self.scroll.get();
+        if s > 0 {
+            self.scroll.set(s - 1);
+        }
+    }
+
+    fn scroll_down(&self) {
+        let total = self.total_lines.get();
+        let visible = self.visible_rows.get();
+        let s = self.scroll.get();
+        if total > visible && s + visible < total {
+            self.scroll.set(s + 1);
+        }
+    }
+
+    fn page_up(&self) {
+        let visible = self.visible_rows.get().max(1);
+        let s = self.scroll.get();
+        self.scroll.set(s.saturating_sub(visible));
+    }
+
+    fn page_down(&self) {
+        let total = self.total_lines.get();
+        let visible = self.visible_rows.get().max(1);
+        let s = self.scroll.get();
+        let max_scroll = total.saturating_sub(visible);
+        self.scroll.set((s + visible).min(max_scroll));
+    }
+}
+
+static MODAL_BINDINGS: &[KeyBinding] = &[
+    KeyBinding {
+        key: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        action: "close",
+        description: "Close",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Char('q'),
+        modifiers: KeyModifiers::NONE,
+        action: "close",
+        description: "Close",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        action: "close",
+        description: "Close",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        action: "scroll_up",
+        description: "Scroll up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('k'),
+        modifiers: KeyModifiers::NONE,
+        action: "scroll_up",
+        description: "Scroll up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        action: "scroll_down",
+        description: "Scroll down",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('j'),
+        modifiers: KeyModifiers::NONE,
+        action: "scroll_down",
+        description: "Scroll down",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        action: "page_up",
+        description: "Page up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        action: "page_down",
+        description: "Page down",
+        show: false,
+    },
+];
+
+impl Widget for MessageModal {
+    fn widget_type_name(&self) -> &'static str {
+        "MessageModal"
+    }
+
+    fn can_focus(&self) -> bool {
+        true
+    }
+
+    fn on_mount(&self, id: WidgetId) {
+        self.own_id.set(Some(id));
+    }
+
+    fn on_unmount(&self, _: WidgetId) {
+        self.own_id.set(None);
+    }
+
+    fn key_bindings(&self) -> &[KeyBinding] {
+        MODAL_BINDINGS
+    }
+
+    fn on_action(&self, action: &str, ctx: &AppContext) {
+        match action {
+            "close" => ctx.pop_screen_deferred(),
+            "scroll_up" => self.scroll_up(),
+            "scroll_down" => self.scroll_down(),
+            "page_up" => self.page_up(),
+            "page_down" => self.page_down(),
+            _ => {}
+        }
+    }
+
+    fn render(&self, _ctx: &AppContext, area: Rect, buf: &mut Buffer) {
+        if area.width < 20 || area.height < 6 {
+            return;
+        }
+
+        // Dim everything beneath the dialog
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(Color::Rgb(5, 5, 15));
+                    cell.set_fg(Color::DarkGray);
+                }
+            }
+        }
+
+        // Dialog box — centered, 70% wide / 70% tall
+        let dlg_w = ((area.width as usize * 7 / 10) as u16).min(100).max(50);
+        let dlg_h = ((area.height as usize * 7 / 10) as u16).max(10).min(area.height.saturating_sub(4));
+        let dlg_x = area.x + area.width.saturating_sub(dlg_w) / 2;
+        let dlg_y = area.y + area.height.saturating_sub(dlg_h) / 2;
+
+        // Fill dialog background
+        let bg = Style::default().bg(Color::Rgb(15, 15, 30)).fg(Color::White);
+        for y in dlg_y..dlg_y + dlg_h {
+            fill_line(buf, dlg_x, y, dlg_w, bg);
+        }
+
+        // Border
+        draw_box(buf, dlg_x, dlg_y, dlg_w, dlg_h, Color::Cyan);
+
+        // Title
+        let title = " Message Detail ";
+        let title_x = dlg_x + dlg_w.saturating_sub(title.len() as u16) / 2;
+        buf.set_string(
+            title_x,
+            dlg_y,
+            title,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        // Inner content
+        let inner_x = dlg_x + 2;
+        let inner_w = dlg_w.saturating_sub(4) as usize;
+        let mut y = dlg_y + 2;
+        let max_y = dlg_y + dlg_h - 2;
+
+        let dim = Style::default().fg(Color::DarkGray);
+
+        let direction = if self.msg.recipient == self.instance_id {
+            format!("From: @{}  →  you", self.msg.sender)
+        } else {
+            format!("you  →  @{}", self.msg.recipient)
+        };
+        put(buf, inner_x, y, &direction, inner_w, Style::default().fg(Color::Yellow));
+        y += 1;
+
+        if y < max_y {
+            let t = format!("Time:  {}", self.msg.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
+            put(buf, inner_x, y, &t, inner_w, dim);
+            y += 1;
+        }
+        if y < max_y {
+            let h = format!("Hash:  {}", self.msg.hash);
+            put(buf, inner_x, y, &h, inner_w, dim);
+            y += 1;
+        }
+        if !self.msg.refs.is_empty() && y < max_y {
+            let r = format!("Refs:  {}", self.msg.refs.join(", "));
+            put(buf, inner_x, y, &r, inner_w, dim);
+            y += 1;
+        }
+
+        // Separator
+        if y < max_y {
+            buf.set_string(inner_x, y, &"─".repeat(inner_w), dim);
+            y += 1;
+        }
+
+        // Word-wrapped content (scrollable)
+        let content_lines = wrap_text(&self.msg.content, inner_w);
+        let total = content_lines.len();
+        let available_rows = max_y.saturating_sub(y) as usize;
+        // Clamp scroll so we don't scroll past the end
+        let max_scroll = total.saturating_sub(available_rows);
+        let scroll = self.scroll.get().min(max_scroll);
+        self.scroll.set(scroll);
+        self.total_lines.set(total);
+        self.visible_rows.set(available_rows);
+
+        for (i, line) in content_lines.iter().enumerate().skip(scroll) {
+            if y >= max_y {
+                break;
+            }
+            put(buf, inner_x, y, line, inner_w, Style::default().fg(Color::White));
+            y += 1;
+            let _ = i;
+        }
+
+        // Hint in bottom border — show scroll indicator if content overflows
+        let hint = if total > available_rows {
+            let pct = if max_scroll == 0 { 100 } else { scroll * 100 / max_scroll };
+            format!(" ↑↓/jk/PgUp/PgDn Scroll ({}%)  [Esc] Close ", pct)
+        } else {
+            " [Esc] Close ".to_string()
+        };
+        let hint_x = dlg_x + dlg_w.saturating_sub(hint.len() as u16) / 2;
+        buf.set_string(hint_x, dlg_y + dlg_h - 1, &hint, dim);
+    }
+}
+
+// ── Render helpers ────────────────────────────────────────────────────────────
+
+/// Truncate to `max` chars, appending '…' if truncated.
+fn clip(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        chars.into_iter().collect()
     } else {
-        format!("{}…", s.chars().take(max - 1).collect::<String>())
+        let mut out: String = chars.into_iter().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
+}
+
+/// Truncate to `max` chars without adding an ellipsis (for content columns).
+fn clip_no_ellipsis(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Pad or truncate to exactly `width` chars.
+fn pad(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= width {
+        chars.into_iter().take(width).collect()
+    } else {
+        format!("{}{}", s, " ".repeat(width - chars.len()))
+    }
+}
+
+/// Fill a full row with spaces in the given style (sets background).
+fn fill_line(buf: &mut Buffer, x: u16, y: u16, w: u16, style: Style) {
+    buf.set_string(x, y, &" ".repeat(w as usize), style);
+}
+
+/// Write a single line, clipped to `max_w`.
+fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, max_w: usize, style: Style) {
+    buf.set_string(x, y, &clip(s, max_w), style);
+}
+
+/// Draw a rounded box border.
+fn draw_box(buf: &mut Buffer, x: u16, y: u16, w: u16, h: u16, color: Color) {
+    let bg = Color::Rgb(15, 15, 30);
+    let s = Style::default().fg(color).bg(bg);
+    if w < 2 || h < 2 {
+        return;
+    }
+    buf.set_string(x, y, "╭", s);
+    buf.set_string(x + w - 1, y, "╮", s);
+    buf.set_string(x, y + h - 1, "╰", s);
+    buf.set_string(x + w - 1, y + h - 1, "╯", s);
+    for i in 1..w - 1 {
+        buf.set_string(x + i, y, "─", s);
+        buf.set_string(x + i, y + h - 1, "─", s);
+    }
+    for i in 1..h - 1 {
+        buf.set_string(x, y + i, "│", s);
+        buf.set_string(x + w - 1, y + i, "│", s);
+    }
+}
+
+/// Human-readable age string.
+fn age_str(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = chrono::Utc::now()
+        .signed_duration_since(dt)
+        .num_seconds()
+        .max(0);
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+/// Word-wrap `text` to lines of at most `width` chars.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![];
+    }
+    let mut lines = vec![];
+    for para in text.split('\n') {
+        if para.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in para.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.len() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    lines
 }

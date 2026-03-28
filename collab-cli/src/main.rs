@@ -67,7 +67,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// List messages intended for this instance (last hour only)
-    List,
+    List {
+        /// Only show messages received since the last time you ran `list`
+        #[arg(short, long)]
+        unread: bool,
+    },
 
     /// Send a message to another instance
     Add {
@@ -163,8 +167,8 @@ async fn main() -> Result<()> {
     let client = CollabClient::new(&server, &instance_id, token.as_deref());
 
     match cli.command {
-        Commands::List => {
-            client.list_messages().await?;
+        Commands::List { unread } => {
+            client.list_messages(unread).await?;
         }
         Commands::Add { recipient, message, refs } => {
             let recipient = recipient.trim_start_matches('@');
@@ -181,7 +185,15 @@ async fn main() -> Result<()> {
             client.show_history(filter_id).await?;
         }
         Commands::Monitor { interval } => {
-            monitor::run(&server, &instance_id, interval, token.as_deref()).await?;
+            let server2 = server.clone();
+            let instance2 = instance_id.clone();
+            let token2 = token.clone();
+            // textual-rs creates its own tokio runtime, so run in a separate thread
+            std::thread::spawn(move || {
+                monitor::run(&server2, &instance2, interval, token2.as_deref())
+            })
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("monitor panicked")))?;
         }
         Commands::Roster | Commands::ConfigPath => unreachable!(),
     }
