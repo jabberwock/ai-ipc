@@ -34,7 +34,8 @@ pub async fn run(server: &str, instance_id: &str, interval_secs: u64) -> Result<
         // Refresh data
         if last_refresh.elapsed() >= Duration::from_secs(interval_secs) {
             match fetch_all(&client, instance_id).await {
-                Ok((w, m)) => {
+                Ok((mut w, m)) => {
+                    w.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
                     workers = w;
                     messages = m;
                     error = None;
