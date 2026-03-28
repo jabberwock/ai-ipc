@@ -87,11 +87,12 @@ Add this to your project's `CLAUDE.md` so each Claude Code worker starts watchin
 ```markdown
 ## Collaboration
 
-At the start of every session, run:
-collab watch --role "brief description of what this worker does"
+At the start of every session:
+1. Run `collab watch --role "<what you are working on right now>"` to announce yourself
+2. Run `collab roster` to see who else is online and what they're doing
+3. Update your role whenever your focus changes: kill the current watch and rerun with an updated --role
 
-This registers you on the roster and watches for messages from other workers.
-Check `collab roster` to see who else is online before starting work.
+Check `collab list` periodically for messages from other workers.
 ```
 
 Each worker's `~/.collab.toml` should already have their `instance` name and `recipients` configured — Claude Code will pick that up automatically.
