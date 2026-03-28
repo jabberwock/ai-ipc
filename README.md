@@ -46,7 +46,17 @@ collab-server
 collab-server.exe
 ```
 
-Listens on port 8000. Creates `collab.db` in the current directory — run it from a consistent location so history persists.
+Creates `collab.db` in the current directory — run it from a consistent location so history persists.
+
+**Options:**
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--host` | `COLLAB_HOST` | `0.0.0.0` | Interface to bind to |
+| `--port` | `COLLAB_PORT` | `8000` | Port to listen on |
+| `--token` | `COLLAB_TOKEN` | _(none)_ | Shared secret for auth |
+
+Without `--token`, the server runs with no authentication (fine for trusted LANs). With it, all requests must supply `Authorization: Bearer <token>`.
 
 ---
 
@@ -62,14 +72,16 @@ Create that file (e.g. `~/.collab.toml` or `C:\Users\<you>\.collab.toml`):
 ```toml
 host = "http://your-server:8000"
 instance = "your-worker-name"
+token = "your-shared-secret"        # omit if server has no token set
 recipients = ["other-worker-1", "other-worker-2"]
 ```
 
 - **host** — address of the collab server
 - **instance** — your worker's unique name
+- **token** — shared secret; must match the server's `--token` if auth is enabled
 - **recipients** — workers you expect to collaborate with; `watch` notifies you when they come online
 
-You can also override with env vars (`COLLAB_SERVER`, `COLLAB_INSTANCE`) or CLI flags (`--server`, `--instance`). Priority: CLI flag > env var > config file.
+You can also override with env vars (`COLLAB_SERVER`, `COLLAB_INSTANCE`, `COLLAB_TOKEN`) or CLI flags (`--server`, `--instance`). Priority: CLI flag > env var > config file.
 
 ---
 
@@ -172,6 +184,40 @@ Fixed auth bug in login.rs
 ```bash
 collab add @MBPC "Confirmed - tests passing" --refs f3b0577
 ```
+
+</details>
+
+---
+
+<details>
+<summary><strong>Security</strong></summary>
+
+**Authentication** is optional but recommended for any non-localhost deployment. Set a shared secret on the server and in each worker's config:
+
+```bash
+# Server
+COLLAB_TOKEN=mysecret collab-server
+
+# ~/.collab.toml (each worker)
+token = "mysecret"
+```
+
+All requests without a valid token return `401 Unauthorized`.
+
+**Input limits** are enforced server-side to prevent abuse:
+
+| Field | Limit |
+|-------|-------|
+| Message content | 4 KB |
+| Instance ID / sender / recipient | 64 chars |
+| Role | 256 chars |
+| Refs per message | 20 entries, 64 chars each |
+
+Requests exceeding these return `413 Payload Too Large`.
+
+**Request timeout** is 30 seconds server-side.
+
+**Network**: designed for trusted LANs or VPNs. For public exposure, put it behind a reverse proxy with TLS.
 
 </details>
 
