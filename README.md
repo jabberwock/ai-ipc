@@ -91,7 +91,7 @@ This heartbeats your presence to the server so others can see you in `collab ros
 collab monitor
 ```
 
-![collab monitor screenshot](https://i.postimg.cc/4KSLGZy0/collab-monitor.png)
+![collab monitor screenshot](assets/claude-ipc.png)
 
 The roster updates every 2 seconds. Press `q` to quit.
 
