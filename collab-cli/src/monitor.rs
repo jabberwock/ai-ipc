@@ -32,7 +32,7 @@ pub async fn run(server: &str, instance_id: &str, interval_secs: u64, token: Opt
 
     loop {
         // Refresh data
-        if last_refresh.elapsed() >= Duration::from_secs(interval_secs) {
+        if Instant::now().checked_duration_since(last_refresh).unwrap_or_default() >= Duration::from_secs(interval_secs) {
             match fetch_all(&client, instance_id).await {
                 Ok((mut w, m)) => {
                     w.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
@@ -138,7 +138,8 @@ pub async fn run(server: &str, instance_id: &str, interval_secs: u64, token: Opt
             f.render_widget(messages_widget, chunks[2]);
 
             // Footer
-            let next_refresh = interval_secs.saturating_sub(last_refresh.elapsed().as_secs());
+            let elapsed = Instant::now().checked_duration_since(last_refresh).unwrap_or_default().as_secs();
+            let next_refresh = interval_secs.saturating_sub(elapsed);
             let status = if let Some(ref e) = error {
                 format!(" Error: {} ", e)
             } else {

@@ -2,7 +2,7 @@ pub mod db;
 
 use axum::{
     extract::{Path, Request, State},
-    http::StatusCode,
+    http::{self, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -23,6 +23,10 @@ const MAX_ROLE_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 4096;
 const MAX_REFS_COUNT: usize = 20;
 const MAX_REF_LEN: usize = 64;
+
+fn is_valid_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessageCreate {
@@ -96,7 +100,7 @@ pub fn create_app(state: AppState) -> Router {
             shared_state.clone(),
             auth_middleware,
         ))
-        .layer(TimeoutLayer::new(StdDuration::from_secs(30)))
+        .layer(TimeoutLayer::with_status_code(http::StatusCode::REQUEST_TIMEOUT, StdDuration::from_secs(30)))
         .layer(CorsLayer::permissive())
         .with_state(shared_state)
 }
@@ -119,7 +123,7 @@ async fn list_messages(
     Path(instance_id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Message>>, StatusCode> {
-    if instance_id.len() > MAX_INSTANCE_ID_LEN {
+    if instance_id.len() > MAX_INSTANCE_ID_LEN || !is_valid_identifier(&instance_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -151,7 +155,7 @@ async fn get_history(
     Path(instance_id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Message>>, StatusCode> {
-    if instance_id.len() > MAX_INSTANCE_ID_LEN {
+    if instance_id.len() > MAX_INSTANCE_ID_LEN || !is_valid_identifier(&instance_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -223,7 +227,7 @@ async fn get_roster(
     for row in message_rows {
         let sender: String = row.get("sender");
         let count: i64 = row.get("message_count");
-        counts.insert(sender, count as usize);
+        counts.insert(sender, usize::try_from(count).unwrap_or(0));
     }
 
     let mut workers: Vec<WorkerInfo> = presence_rows
@@ -275,7 +279,7 @@ async fn get_roster(
                 instance_id,
                 role: String::new(),
                 last_seen: last_seen.with_timezone(&Utc),
-                message_count: row.get::<i64, _>("message_count") as usize,
+                message_count: usize::try_from(row.get::<i64, _>("message_count")).unwrap_or(0),
             });
         }
     }
@@ -290,8 +294,8 @@ async fn update_presence(
 ) -> Result<StatusCode, StatusCode> {
     let role = payload.role.unwrap_or_default();
 
-    if instance_id.len() > MAX_INSTANCE_ID_LEN || role.len() > MAX_ROLE_LEN {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    if instance_id.len() > MAX_INSTANCE_ID_LEN || !is_valid_identifier(&instance_id) || role.len() > MAX_ROLE_LEN {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let now = Utc::now().to_rfc3339();
@@ -324,11 +328,13 @@ async fn create_message(
 ) -> Result<Json<Message>, StatusCode> {
     if payload.sender.len() > MAX_INSTANCE_ID_LEN
         || payload.recipient.len() > MAX_INSTANCE_ID_LEN
+        || !is_valid_identifier(&payload.sender)
+        || !is_valid_identifier(&payload.recipient)
         || payload.content.len() > MAX_CONTENT_LEN
         || payload.refs.len() > MAX_REFS_COUNT
         || payload.refs.iter().any(|r| r.len() > MAX_REF_LEN)
     {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     let timestamp = Utc::now();
