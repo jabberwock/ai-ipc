@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 use textual_rs::{
     event::keybinding::KeyBinding,
+    hyperlink::render_hyperlink,
     widget::{context::AppContext, EventPropagation, WidgetId},
     App, ModalScreen, Widget, WorkerResult,
 };
@@ -1285,13 +1286,22 @@ impl Widget for MessageModal {
             y += 1;
         }
         if y < max_y {
-            let h = format!("Hash:  {}", self.msg.hash);
-            put(buf, inner_x, y, &h, inner_w, dim);
+            put(buf, inner_x, y, "Hash:  ", inner_w, dim);
+            render_hash_link(buf, inner_x + 7, y, &self.msg.hash, dim);
             y += 1;
         }
         if !self.msg.refs.is_empty() && y < max_y {
-            let r = format!("Refs:  {}", self.msg.refs.join(", "));
-            put(buf, inner_x, y, &r, inner_w, dim);
+            put(buf, inner_x, y, "Refs:  ", inner_w, dim);
+            let mut rx = inner_x + 7;
+            let max_rx = inner_x + inner_w as u16;
+            for (i, r) in self.msg.refs.iter().enumerate() {
+                if rx >= max_rx { break; }
+                if i > 0 {
+                    buf.set_string(rx, y, ", ", dim);
+                    rx += 2;
+                }
+                rx += render_hash_link(buf, rx, y, r, dim);
+            }
             y += 1;
         }
 
@@ -1373,6 +1383,18 @@ fn fill_line(buf: &mut Buffer, x: u16, y: u16, w: u16, style: Style) {
 /// Write a single line, clipped to `max_w`.
 fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, max_w: usize, style: Style) {
     buf.set_string(x, y, &clip(s, max_w), style);
+}
+
+/// Render a hash as an OSC 8 hyperlink if COLLAB_REPO is set, otherwise plain text.
+/// Returns the number of terminal columns consumed.
+fn render_hash_link(buf: &mut Buffer, x: u16, y: u16, hash: &str, style: Style) -> u16 {
+    if let Ok(repo) = std::env::var("COLLAB_REPO") {
+        let url = format!("{}/commit/{}", repo.trim_end_matches('/'), hash);
+        render_hyperlink(buf, x, y, &url, hash, style)
+    } else {
+        buf.set_string(x, y, hash, style);
+        hash.chars().count() as u16
+    }
 }
 
 /// Draw a rounded box border.

@@ -162,9 +162,20 @@ collab history @agent                   # conversation thread with one agent
 collab monitor                          # live roster + message activity
                                         # F1 or c: compose modal (broadcast by default)
                                         # R: reply to selected message
+                                        # Hash/Refs fields are clickable OSC 8 links
+                                        #   when COLLAB_REPO is set
 ```
 
 The `@` prefix is optional — `@agent` and `agent` are the same.
+
+Set `COLLAB_REPO` to your repository URL to get clickable hash links in `collab monitor`:
+
+```bash
+export COLLAB_REPO=https://github.com/owner/repo
+```
+
+Message hashes and refs in the detail view will link to `$COLLAB_REPO/commit/<hash>`.
+Requires a terminal with OSC 8 support (iTerm2, Ghostty, WezTerm, Windows Terminal, kitty).
 
 ---
 
