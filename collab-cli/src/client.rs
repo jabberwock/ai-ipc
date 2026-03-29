@@ -8,7 +8,7 @@ use std::path::PathBuf;
 // ── Read-state persistence ────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct ReadState {
+pub struct ReadState {
     /// instance_id → timestamp of the newest message seen in the last `list` run
     last_read: HashMap<String, DateTime<Utc>>,
     /// instance_id → last role set via `collab watch --role`
@@ -16,6 +16,9 @@ struct ReadState {
     /// set of message hashes we have replied to (via `reply` or `add --refs`)
     #[serde(default)]
     replied: HashSet<String>,
+    /// last recipient used in compose modal, per instance_id
+    #[serde(default)]
+    pub last_compose_recipient: HashMap<String, String>,
 }
 
 fn state_path() -> Option<PathBuf> {
@@ -26,14 +29,14 @@ fn state_path() -> Option<PathBuf> {
     home.map(|h| h.join(".collab_state.toml"))
 }
 
-fn load_read_state() -> ReadState {
+pub fn load_read_state() -> ReadState {
     state_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_read_state(state: &ReadState) {
+pub fn save_read_state(state: &ReadState) {
     if let Some(path) = state_path() {
         if let Ok(s) = toml::to_string(state) {
             let _ = std::fs::write(path, s);
@@ -324,12 +327,13 @@ impl CollabClient {
         Ok(())
     }
 
-    pub async fn add_message(
+    /// Send a message and return the resulting Message object (no stdout output).
+    pub async fn send_message_raw(
         &self,
         recipient: &str,
         content: &str,
-        refs: Option<Vec<String>>,
-    ) -> Result<()> {
+        refs: Vec<String>,
+    ) -> Result<Message> {
         #[derive(Serialize)]
         struct CreateMessage {
             sender: String,
@@ -338,16 +342,14 @@ impl CollabClient {
             refs: Vec<String>,
         }
 
-        let ref_hashes = refs.unwrap_or_default();
         let payload = CreateMessage {
             sender: self.instance_id.clone(),
             recipient: recipient.to_string(),
             content: content.to_string(),
-            refs: ref_hashes.clone(),
+            refs: refs.clone(),
         };
 
         let url = format!("{}/messages", self.base_url);
-
         let response = self.auth(self.client.post(&url))
             .json(&payload)
             .send()
@@ -360,18 +362,27 @@ impl CollabClient {
         let msg: Message = response.json().await?;
 
         // Mark any referenced messages as replied
-        if !ref_hashes.is_empty() {
+        if !refs.is_empty() {
             let mut state = load_read_state();
-            for h in &ref_hashes {
+            for h in &refs {
                 state.replied.insert(h.clone());
             }
             save_read_state(&state);
         }
 
+        Ok(msg)
+    }
+
+    pub async fn add_message(
+        &self,
+        recipient: &str,
+        content: &str,
+        refs: Option<Vec<String>>,
+    ) -> Result<()> {
+        let msg = self.send_message_raw(recipient, content, refs.unwrap_or_default()).await?;
         println!("✓ Message sent to @{}", recipient);
         println!("  Hash: {}", &msg.hash[..7]);
         println!("  Time: {}", msg.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
-
         Ok(())
     }
 

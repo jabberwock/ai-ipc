@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -13,9 +13,10 @@ use textual_rs::{
     App, ModalScreen, Widget, WorkerResult,
 };
 
-use crate::client::{CollabClient, Message, WorkerInfo};
+use crate::client::{load_read_state, save_read_state, CollabClient, Message, WorkerInfo};
 
 type FetchData = (Vec<WorkerInfo>, Vec<Message>);
+type SendResult = Result<String, String>; // Ok(hash of first sent msg) or Err(message)
 
 // ── CSS ───────────────────────────────────────────────────────────────────────
 const CSS: &str = r#"
@@ -30,6 +31,38 @@ MessageModal {
     width: 100%;
 }
 "#;
+
+// ── Send helper (runs inside worker future) ───────────────────────────────────
+
+async fn send_to_all(
+    server: String,
+    instance_id: String,
+    token: Option<String>,
+    recipients: Vec<String>,
+    content: String,
+    reply_hash: Option<String>,
+) -> SendResult {
+    let client = CollabClient::new(&server, &instance_id, token.as_deref());
+    let refs = reply_hash.into_iter().collect::<Vec<_>>();
+    let mut last_hash = String::new();
+    for recipient in &recipients {
+        match client.send_message_raw(recipient, &content, refs.clone()).await {
+            Ok(msg) => last_hash = msg.hash,
+            Err(e) => return Err(format!("Failed sending to @{}: {}", recipient, e)),
+        }
+    }
+    Ok(last_hash)
+}
+
+// ── Least-capacitated helper ─────────────────────────────────────────────────
+
+/// Returns the instance_id of the worker (not self) with the fewest messages.
+fn least_capacitated<'a>(workers: &'a [WorkerInfo], self_id: &str) -> Option<&'a str> {
+    workers.iter()
+        .filter(|w| w.instance_id != self_id)
+        .min_by_key(|w| w.message_count)
+        .map(|w| w.instance_id.as_str())
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -144,6 +177,46 @@ impl MonitorScreen {
         let dialog = MessageModal::new(msg, self.instance_id.clone());
         ctx.push_screen_deferred(Box::new(ModalScreen::new(Box::new(dialog))));
     }
+
+    fn open_compose(&self, ctx: &AppContext, reply_hash: Option<String>, reply_to: Option<String>) {
+        let workers = self.workers.borrow().clone();
+        let others: Vec<WorkerInfo> = workers.into_iter()
+            .filter(|w| w.instance_id != self.instance_id)
+            .collect();
+        if others.is_empty() {
+            return;
+        }
+        // Pre-select all; if replying, only pre-select the reply target
+        let selected: Vec<bool> = others.iter().map(|w| {
+            match &reply_to {
+                Some(id) => &w.instance_id == id,
+                None => true,
+            }
+        }).collect();
+        let modal = ComposeModal::new(
+            self.server.clone(),
+            self.instance_id.clone(),
+            self.token.clone(),
+            others,
+            selected,
+            reply_hash,
+        );
+        ctx.push_screen_deferred(Box::new(ModalScreen::new(Box::new(modal))));
+    }
+
+    fn open_reply(&self, ctx: &AppContext) {
+        let messages = self.messages.borrow();
+        let len = messages.len();
+        if len == 0 { return; }
+        let cursor = self.msg_cursor.get();
+        let vec_idx = len.saturating_sub(1 + cursor);
+        if vec_idx >= len { return; }
+        let msg = messages[vec_idx].clone();
+        drop(messages);
+        // Only reply to incoming messages
+        if msg.sender == self.instance_id { return; }
+        self.open_compose(ctx, Some(msg.hash), Some(msg.sender));
+    }
 }
 
 static MONITOR_BINDINGS: &[KeyBinding] = &[
@@ -203,6 +276,27 @@ static MONITOR_BINDINGS: &[KeyBinding] = &[
         description: "View",
         show: true,
     },
+    KeyBinding {
+        key: KeyCode::F(1),
+        modifiers: KeyModifiers::NONE,
+        action: "compose",
+        description: "New message",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Char('c'),
+        modifiers: KeyModifiers::NONE,
+        action: "compose",
+        description: "New message",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('R'),
+        modifiers: KeyModifiers::SHIFT,
+        action: "reply",
+        description: "Reply to selected",
+        show: true,
+    },
 ];
 
 impl Widget for MonitorScreen {
@@ -244,6 +338,8 @@ impl Widget for MonitorScreen {
                 }
             }
             "view_message" => self.open_modal(ctx),
+            "compose" => self.open_compose(ctx, None, None),
+            "reply" => self.open_reply(ctx),
             _ => {}
         }
     }
@@ -403,10 +499,12 @@ impl Widget for MonitorScreen {
         buf.set_string(area.x, content_start + 2, &clip(&r_sep, w), sep_style);
 
         // Worker rows
+        let lc = least_capacitated(&workers, &self.instance_id);
         for (i, worker) in workers.iter().enumerate().take(roster_data_visible as usize) {
             let y = content_start + 3 + i as u16;
             let you = if worker.instance_id == self.instance_id { " ◀" } else { "" };
-            let name = format!("@{}{}", worker.instance_id, you);
+            let star = if Some(worker.instance_id.as_str()) == lc { " ★" } else { "" };
+            let name = format!("@{}{}{}", worker.instance_id, star, you);
             let role = if worker.role.is_empty() {
                 "—".to_string()
             } else {
@@ -543,9 +641,7 @@ impl Widget for MonitorScreen {
         let footer_text = if let Some(ref e) = *error {
             format!(" Error: {}", e)
         } else {
-            format!(
-                " ↑↓ Navigate  │  Enter View  │  r Refresh  │  q Quit"
-            )
+            format!(" ↑↓ Navigate  │  Enter View  │  F1/c Compose  │  R Reply  │  r Refresh  │  q Quit")
         };
         let footer_style = if error.is_some() {
             Style::default().fg(Color::Red)
@@ -557,6 +653,385 @@ impl Widget for MonitorScreen {
         drop(workers);
         drop(messages);
         drop(error);
+    }
+}
+
+// ── ComposeModal ──────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum ComposeField { Recipients, Message }
+
+struct ComposeModal {
+    server: String,
+    instance_id: String,
+    token: Option<String>,
+    /// Other workers (self excluded)
+    workers: Vec<WorkerInfo>,
+    /// Checked state per worker
+    selected: RefCell<Vec<bool>>,
+    /// Cursor within recipient list
+    list_cursor: Cell<usize>,
+    /// Scroll offset for recipient list
+    list_scroll: Cell<usize>,
+    /// Which field is focused
+    focused: Cell<ComposeField>,
+    /// The message being typed
+    message: RefCell<String>,
+    /// Optional hash to attach as reply ref
+    reply_hash: Option<String>,
+    own_id: Cell<Option<WidgetId>>,
+    sending: Cell<bool>,
+    error: RefCell<Option<String>>,
+    /// How many visible rows the recipient list has (updated each render)
+    list_visible_rows: Cell<usize>,
+}
+
+impl ComposeModal {
+    fn new(
+        server: String,
+        instance_id: String,
+        token: Option<String>,
+        workers: Vec<WorkerInfo>,
+        selected: Vec<bool>,
+        reply_hash: Option<String>,
+    ) -> Self {
+        Self {
+            server,
+            instance_id,
+            token,
+            workers,
+            selected: RefCell::new(selected),
+            list_cursor: Cell::new(0),
+            list_scroll: Cell::new(0),
+            focused: Cell::new(ComposeField::Recipients),
+            message: RefCell::new(String::new()),
+            reply_hash,
+            own_id: Cell::new(None),
+            sending: Cell::new(false),
+            error: RefCell::new(None),
+            list_visible_rows: Cell::new(4),
+        }
+    }
+
+    fn clamp_list_scroll(&self) {
+        let cursor = self.list_cursor.get();
+        let scroll = self.list_scroll.get();
+        let visible = self.list_visible_rows.get().max(1);
+        if cursor < scroll {
+            self.list_scroll.set(cursor);
+        } else if cursor >= scroll + visible {
+            self.list_scroll.set(cursor + 1 - visible);
+        }
+    }
+
+    fn do_send(&self, ctx: &AppContext) {
+        let message = self.message.borrow().trim().to_string();
+        if message.is_empty() {
+            *self.error.borrow_mut() = Some("Message cannot be empty".to_string());
+            return;
+        }
+        let selected = self.selected.borrow();
+        let recipients: Vec<String> = self.workers.iter().enumerate()
+            .filter(|(i, _)| selected.get(*i).copied().unwrap_or(false))
+            .map(|(_, w)| w.instance_id.clone())
+            .collect();
+        drop(selected);
+        if recipients.is_empty() {
+            *self.error.borrow_mut() = Some("Select at least one recipient".to_string());
+            return;
+        }
+        let Some(id) = self.own_id.get() else { return };
+        self.sending.set(true);
+        *self.error.borrow_mut() = None;
+
+        // Persist the first recipient as last_compose_recipient
+        let mut state = load_read_state();
+        state.last_compose_recipient.insert(self.instance_id.clone(), recipients[0].clone());
+        save_read_state(&state);
+
+        let server = self.server.clone();
+        let instance_id = self.instance_id.clone();
+        let token = self.token.clone();
+        let reply_hash = self.reply_hash.clone();
+        ctx.run_worker(id, send_to_all(server, instance_id, token, recipients, message, reply_hash));
+    }
+}
+
+static COMPOSE_BINDINGS: &[KeyBinding] = &[
+    KeyBinding {
+        key: KeyCode::Esc,
+        modifiers: KeyModifiers::NONE,
+        action: "close",
+        description: "Cancel",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Tab,
+        modifiers: KeyModifiers::NONE,
+        action: "tab",
+        description: "Switch field",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Enter,
+        modifiers: KeyModifiers::NONE,
+        action: "enter",
+        description: "Send",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Up,
+        modifiers: KeyModifiers::NONE,
+        action: "list_up",
+        description: "Up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('k'),
+        modifiers: KeyModifiers::NONE,
+        action: "list_up",
+        description: "Up",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Down,
+        modifiers: KeyModifiers::NONE,
+        action: "list_down",
+        description: "Down",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char('j'),
+        modifiers: KeyModifiers::NONE,
+        action: "list_down",
+        description: "Down",
+        show: false,
+    },
+    KeyBinding {
+        key: KeyCode::Char(' '),
+        modifiers: KeyModifiers::NONE,
+        action: "toggle",
+        description: "Toggle",
+        show: true,
+    },
+    KeyBinding {
+        key: KeyCode::Char('a'),
+        modifiers: KeyModifiers::NONE,
+        action: "select_all",
+        description: "All",
+        show: true,
+    },
+];
+
+impl Widget for ComposeModal {
+    fn widget_type_name(&self) -> &'static str { "ComposeModal" }
+    fn can_focus(&self) -> bool { true }
+    fn on_mount(&self, id: WidgetId) { self.own_id.set(Some(id)); }
+    fn on_unmount(&self, _: WidgetId) { self.own_id.set(None); }
+    fn key_bindings(&self) -> &[KeyBinding] { COMPOSE_BINDINGS }
+
+    fn on_action(&self, action: &str, ctx: &AppContext) {
+        if self.sending.get() { return; }
+        match action {
+            "close" => ctx.pop_screen_deferred(),
+            "tab" => {
+                self.focused.set(match self.focused.get() {
+                    ComposeField::Recipients => ComposeField::Message,
+                    ComposeField::Message => ComposeField::Recipients,
+                });
+            }
+            "enter" => {
+                match self.focused.get() {
+                    ComposeField::Recipients => self.focused.set(ComposeField::Message),
+                    ComposeField::Message => self.do_send(ctx),
+                }
+            }
+            "list_up" if self.focused.get() == ComposeField::Recipients => {
+                let cur = self.list_cursor.get();
+                if cur > 0 { self.list_cursor.set(cur - 1); }
+            }
+            "list_down" if self.focused.get() == ComposeField::Recipients => {
+                let len = self.workers.len();
+                let cur = self.list_cursor.get();
+                if cur + 1 < len { self.list_cursor.set(cur + 1); }
+            }
+            "toggle" if self.focused.get() == ComposeField::Recipients => {
+                let cur = self.list_cursor.get();
+                let mut sel = self.selected.borrow_mut();
+                if let Some(v) = sel.get_mut(cur) { *v = !*v; }
+            }
+            "select_all" if self.focused.get() == ComposeField::Recipients => {
+                let mut sel = self.selected.borrow_mut();
+                let any_unchecked = sel.iter().any(|&v| !v);
+                for v in sel.iter_mut() { *v = any_unchecked; }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_event(&self, event: &dyn std::any::Any, ctx: &AppContext) -> EventPropagation {
+        // Send result
+        if let Some(result) = event.downcast_ref::<WorkerResult<SendResult>>() {
+            self.sending.set(false);
+            match &result.value {
+                Ok(_) => ctx.pop_screen_deferred(),
+                Err(e) => *self.error.borrow_mut() = Some(e.clone()),
+            }
+            return EventPropagation::Stop;
+        }
+
+        // Raw key events for text input in message field
+        if let Some(key) = event.downcast_ref::<KeyEvent>() {
+            if self.sending.get() { return EventPropagation::Stop; }
+            if self.focused.get() == ComposeField::Message {
+                match key.code {
+                    KeyCode::Char(c) => {
+                        self.message.borrow_mut().push(c);
+                        return EventPropagation::Stop;
+                    }
+                    KeyCode::Backspace => {
+                        self.message.borrow_mut().pop();
+                        return EventPropagation::Stop;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        EventPropagation::Continue
+    }
+
+    fn render(&self, _ctx: &AppContext, area: Rect, buf: &mut Buffer) {
+        if area.width < 30 || area.height < 10 { return; }
+
+        // Dim background
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_bg(Color::Rgb(5, 5, 15));
+                    cell.set_fg(Color::DarkGray);
+                }
+            }
+        }
+
+        let n_workers = self.workers.len();
+        // dialog height: title(1) + pad(1) + list_header(1) + list rows + pad(1) + msg_label(1) + msg_row(1) + error(1) + footer(1)
+        let list_rows = n_workers.min(6);
+        let dlg_h = (8 + list_rows as u16).min(area.height.saturating_sub(2));
+        let dlg_w = ((area.width as usize * 8 / 10) as u16).min(90).max(50);
+        let dlg_x = area.x + area.width.saturating_sub(dlg_w) / 2;
+        let dlg_y = area.y + area.height.saturating_sub(dlg_h) / 2;
+
+        let bg_style = Style::default().bg(Color::Rgb(15, 15, 30)).fg(Color::White);
+        for y in dlg_y..dlg_y + dlg_h {
+            fill_line(buf, dlg_x, y, dlg_w, bg_style);
+        }
+
+        let sending = self.sending.get();
+        let border_col = if sending { Color::Yellow } else { Color::Cyan };
+        draw_box(buf, dlg_x, dlg_y, dlg_w, dlg_h, border_col);
+
+        let title = if sending { " Sending… " }
+                    else if self.reply_hash.is_some() { " Reply " }
+                    else { " New Message " };
+        let title_x = dlg_x + dlg_w.saturating_sub(title.len() as u16) / 2;
+        buf.set_string(title_x, dlg_y, title,
+            Style::default().fg(Color::Black).bg(border_col).add_modifier(Modifier::BOLD));
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let inner_x = dlg_x + 2;
+        let inner_w = dlg_w.saturating_sub(4) as usize;
+        let mut y = dlg_y + 2;
+        let max_y = dlg_y + dlg_h - 1;
+
+        // ── Recipient list ─────────────────────────────────────────────────────
+        let list_focused = self.focused.get() == ComposeField::Recipients;
+        let lc = least_capacitated(&self.workers, &self.instance_id);
+        let lbl_style = if list_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else { dim };
+        let selected_count = self.selected.borrow().iter().filter(|&&v| v).count();
+        let rcpt_label = format!("Recipients: {}/{} selected  (Space toggle, a all/none)", selected_count, n_workers);
+        if y < max_y { buf.set_string(inner_x, y, &clip(&rcpt_label, inner_w), lbl_style); y += 1; }
+
+        let cursor = self.list_cursor.get();
+        // Compute visible rows for this render
+        let available_list = (max_y.saturating_sub(y + 4)) as usize; // leave room for msg+footer
+        let visible = available_list.min(n_workers).max(1);
+        self.list_visible_rows.set(visible);
+        self.clamp_list_scroll();
+        let scroll = self.list_scroll.get();
+
+        let sel = self.selected.borrow();
+        for row in 0..visible {
+            let idx = scroll + row;
+            if idx >= n_workers { break; }
+            if y >= max_y { break; }
+            let worker = &self.workers[idx];
+            let checked = sel.get(idx).copied().unwrap_or(false);
+            let is_cursor = list_focused && idx == cursor;
+            let star = if Some(worker.instance_id.as_str()) == lc { " ★" } else { "" };
+            let check = if checked { "✓" } else { " " };
+            let scroll_marker = if idx == scroll && scroll > 0 { "↑" }
+                                 else if idx == scroll + visible - 1 && scroll + visible < n_workers { "↓" }
+                                 else { " " };
+            let row_text = format!(" [{}]{} @{}{}", check, scroll_marker, worker.instance_id, star);
+            let row_style = if is_cursor {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if checked {
+                Style::default().fg(Color::Green)
+            } else {
+                dim
+            };
+            if is_cursor {
+                fill_line(buf, inner_x, y, inner_w as u16, row_style);
+            }
+            buf.set_string(inner_x, y, &clip(&row_text, inner_w), row_style);
+            y += 1;
+        }
+        drop(sel);
+
+        y += 1; // spacing
+
+        // ── Message field ──────────────────────────────────────────────────────
+        let msg_focused = self.focused.get() == ComposeField::Message;
+        let msg_lbl_style = if msg_focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else { dim };
+        if y < max_y {
+            buf.set_string(inner_x, y, "Message:", msg_lbl_style);
+            y += 1;
+        }
+        if y < max_y {
+            let msg = self.message.borrow();
+            let field_w = inner_w;
+            let display = if msg_focused {
+                let s = tail_chars(&msg, field_w.saturating_sub(1));
+                format!("{}|", s)
+            } else {
+                tail_chars(&msg, field_w)
+            };
+            let msg_bg = if msg_focused {
+                Style::default().fg(Color::White).bg(Color::Rgb(20, 20, 50))
+            } else {
+                Style::default().fg(Color::White)
+            };
+            fill_line(buf, inner_x, y, inner_w as u16, msg_bg);
+            buf.set_string(inner_x, y, &display, msg_bg);
+        }
+
+        // ── Error line ─────────────────────────────────────────────────────────
+        if let Some(ref e) = *self.error.borrow() {
+            let ey = dlg_y + dlg_h - 3;
+            if ey > dlg_y + 2 {
+                put(buf, inner_x, ey, e, inner_w, Style::default().fg(Color::Red));
+            }
+        }
+
+        // ── Footer ─────────────────────────────────────────────────────────────
+        let hint = " [Tab] Switch  [↑↓] Navigate  [Space] Toggle  [Enter] Send  [Esc] Cancel ";
+        let hint_x = dlg_x + dlg_w.saturating_sub(hint.len() as u16) / 2;
+        buf.set_string(hint_x, dlg_y + dlg_h - 1, &clip(hint, dlg_w as usize), dim);
     }
 }
 
@@ -902,6 +1377,17 @@ fn age_str(dt: chrono::DateTime<chrono::Utc>) -> String {
         format!("{}m ago", secs / 60)
     } else {
         format!("{}h ago", secs / 3600)
+    }
+}
+
+/// Return the last `max` chars of `s` (so the cursor end is always visible).
+fn tail_chars(s: &str, max: usize) -> String {
+    if max == 0 { return String::new(); }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        chars.into_iter().collect()
+    } else {
+        chars[chars.len() - max..].iter().collect()
     }
 }
 
