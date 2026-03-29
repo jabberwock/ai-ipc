@@ -282,18 +282,11 @@ static MONITOR_BINDINGS: &[KeyBinding] = &[
         show: true,
     },
     KeyBinding {
-        key: KeyCode::F(1),
+        key: KeyCode::Char('n'),
         modifiers: KeyModifiers::NONE,
         action: "compose",
         description: "New message",
         show: true,
-    },
-    KeyBinding {
-        key: KeyCode::Char('c'),
-        modifiers: KeyModifiers::NONE,
-        action: "compose",
-        description: "New message",
-        show: false,
     },
     KeyBinding {
         key: KeyCode::Char('R'),
@@ -649,7 +642,7 @@ impl Widget for MonitorScreen {
         } else if let Some(ref s) = *status_msg {
             format!(" {}", s)
         } else {
-            format!(" ↑↓ Navigate  │  Enter View  │  F1/c Compose  │  R Reply  │  r Refresh  │  q Quit")
+            format!(" ↑↓ Navigate  │  Enter View  │  n New message  │  R Reply  │  r Refresh  │  q Quit")
         };
         let footer_style = if error.is_some() {
             Style::default().fg(Color::Red)
