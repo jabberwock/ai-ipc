@@ -50,14 +50,23 @@ pub fn repo_url() -> Option<String> {
 /// Return a hash formatted as an OSC 8 terminal hyperlink when stdout is a tty.
 /// Auto-detects repo URL from COLLAB_REPO env var or git remote. Falls back to plain text.
 fn link_hash(hash: &str) -> String {
-    use std::os::unix::io::AsRawFd;
-    let is_tty = unsafe { libc::isatty(std::io::stdout().as_raw_fd()) } == 1;
-    if let (true, Some(repo)) = (is_tty, repo_url()) {
+    if let (true, Some(repo)) = (is_stdout_tty(), repo_url()) {
         let url = format!("{}/commit/{}", repo, hash);
         format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, hash)
     } else {
         hash.to_string()
     }
+}
+
+#[cfg(unix)]
+fn is_stdout_tty() -> bool {
+    use std::os::unix::io::AsRawFd;
+    (unsafe { libc::isatty(std::io::stdout().as_raw_fd()) }) == 1
+}
+
+#[cfg(not(unix))]
+fn is_stdout_tty() -> bool {
+    false
 }
 
 // ── Read-state persistence ────────────────────────────────────────────────────
