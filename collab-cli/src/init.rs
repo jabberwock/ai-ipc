@@ -172,16 +172,23 @@ Run these in order at the start of every session:
 collab status
 ```
 
-**2. Start watching for messages (also updates your presence in the roster):**
-```bash
-collab watch --role "{role}" --interval 30
+**2. Set up your message poll (this wakes your Claude session when messages arrive):**
+```
+/loop 1m collab list
 ```
 
-This polls every 30 seconds, keeps your role visible in the roster, and will automatically exit when a stop signal is received.
+This injects `collab list` as a prompt every minute — the only mechanism that delivers messages into your Claude session.
 
-**3. Stop condition:**
+**3. Stream for the web dashboard (optional but recommended):**
+```bash
+collab stream --role "{role}"
+```
 
-`collab watch` will exit automatically when a stop signal is broadcast. When it does, send a final summary and finish:
+Keeps your role visible in the roster and feeds the web dashboard. Does NOT inject messages into your session — the cron loop above handles that.
+
+**4. Stop condition:**
+
+When a stop signal arrives via `collab list`, send a final summary and finish:
 ```bash
 collab broadcast "Shutting down: <brief summary of work done>"
 ```
