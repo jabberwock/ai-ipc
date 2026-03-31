@@ -277,6 +277,19 @@
     .sound-btn[data-on="true"]  { color: var(--sub); }
     .sound-btn[data-on="false"] { color: var(--dim); opacity: .5; }
 
+    .stop-btn {
+      display: flex; align-items: center; gap: 5px; padding: 3px 10px;
+      font-size: 12px; font-weight: 700; letter-spacing: .03em;
+      color: #ef4444; background: rgba(239,68,68,.08);
+      border: 1px solid rgba(239,68,68,.25); border-radius: 4px;
+      transition: background var(--t), border-color var(--t), color var(--t);
+    }
+    .stop-btn:hover { background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.5); }
+    .stop-btn[data-state="stopped"] {
+      color: #22c55e; background: rgba(34,197,94,.08); border-color: rgba(34,197,94,.25);
+    }
+    .stop-btn[data-state="stopped"]:hover { background: rgba(34,197,94,.18); border-color: rgba(34,197,94,.5); }
+
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 
     @media (max-width: 720px) {
@@ -302,6 +315,7 @@
   </button>
   <input type="file" id="import-file" accept=".json" aria-hidden="true">
   <button class="sound-btn" id="sound-btn" data-on="true" aria-label="Toggle notification sound" title="Notification sound">🔔</button>
+  <button class="stop-btn" id="stop-btn" data-state="running" aria-label="Stop all worker polling">⏹ Stop All</button>
   <div id="conn" class="conn" role="status" aria-live="polite" aria-atomic="true">
     <span class="conn-dot" aria-hidden="true"></span>
     <span class="conn-label" id="conn-label">connecting…</span>
@@ -945,6 +959,36 @@ document.getElementById('compose-input').addEventListener('keydown', e => {
     if (e.key === 'Escape') { closeMentionList(); return; }
   }
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+});
+
+// ── Stop / resume all workers ─────────────────────────────────────────────────
+const STOP_SIGNAL = '__COLLAB_STOP_WATCH__';
+
+document.getElementById('stop-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('stop-btn');
+  const stopped = btn.dataset.state === 'stopped';
+
+  if (!stopped) {
+    const ok = confirm('Send stop signal to all workers?\n\nThis will interrupt any active collab watch sessions.');
+    if (!ok) return;
+  }
+
+  const sender = document.getElementById('compose-name').value.trim() || 'dashboard';
+  const content = stopped ? 'Polling resumed — collab watch restart requested' : STOP_SIGNAL;
+
+  try {
+    await api('/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender, recipient: 'all', content, refs: [] }),
+    });
+    btn.dataset.state = stopped ? 'running' : 'stopped';
+    btn.textContent  = stopped ? '⏹ Stop All' : '▶ Resume All';
+    btn.setAttribute('aria-label', stopped ? 'Stop all worker polling' : 'Resume all worker polling');
+    await pollAll();
+  } catch {
+    announce('Failed to send signal — is the server running?');
+  }
 });
 
 // ── Import config ─────────────────────────────────────────────────────────────
