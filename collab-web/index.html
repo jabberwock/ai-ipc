@@ -1317,13 +1317,17 @@ async function heartbeat() {
   } catch {} // silent — don't disrupt anything if it fails
 }
 
+let _sseRetryTimer = null;
+let _sseRetryDelay = 1000;
+
 function startSSE() {
+  if (_sseRetryTimer) { clearTimeout(_sseRetryTimer); _sseRetryTimer = null; }
   if (S.sse) { S.sse.close(); S.sse = null; }
   const url = S.token
     ? `${S.url.replace(/\/$/,'')}/events?token=${encodeURIComponent(S.token)}`
     : `${S.url.replace(/\/$/,'')}/events`;
   const es = new EventSource(url);
-  es.onopen = () => setConn('ok');
+  es.onopen = () => { setConn('ok'); _sseRetryDelay = 1000; };
   es.onmessage = e => {
     try {
       const msg = JSON.parse(e.data);
@@ -1336,7 +1340,15 @@ function startSSE() {
       document.getElementById('last-updated').textContent = 'updated ' + new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit'});
     } catch {}
   };
-  es.onerror = () => { setConn('err'); };
+  es.onerror = () => {
+    setConn('err');
+    es.close();
+    S.sse = null;
+    _sseRetryTimer = setTimeout(() => {
+      _sseRetryDelay = Math.min(_sseRetryDelay * 2, 30000);
+      startSSE();
+    }, _sseRetryDelay);
+  };
   S.sse = es;
 }
 
@@ -1891,7 +1903,6 @@ document.getElementById('server-token').addEventListener('change', e => {
   localStorage.setItem('collab-token', S.token);
   setConn('connecting');
   startPolling();
-  startSSE();
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
