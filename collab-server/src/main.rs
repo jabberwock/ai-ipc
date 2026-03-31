@@ -16,6 +16,10 @@ struct Args {
     /// Shared secret token for authentication (if unset, auth is disabled)
     #[arg(long, env = "COLLAB_TOKEN")]
     token: Option<String>,
+
+    /// Audit log mode — disables message deletion and stamps read_at on delivery
+    #[arg(long, env = "COLLAB_AUDIT")]
+    audit: bool,
 }
 
 #[tokio::main]
@@ -25,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let db = db::init_db().await?;
-    let state = AppState { db, token: args.token.clone() };
+    let state = AppState { db, token: args.token.clone(), audit: args.audit };
     let app = collab_server::create_app(state);
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -35,6 +39,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Auth enabled — token required on all requests");
     } else {
         tracing::warn!("Auth disabled — set --token or COLLAB_TOKEN to enable");
+    }
+    if args.audit {
+        tracing::info!("Audit log mode enabled — messages retained indefinitely, read_at stamped on delivery");
     }
     tracing::info!("Server listening on http://{}", addr);
 

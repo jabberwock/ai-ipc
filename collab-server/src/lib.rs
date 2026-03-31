@@ -51,6 +51,8 @@ pub struct Message {
     pub content: String,
     pub refs: Vec<String>,
     pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,6 +72,7 @@ pub struct PresenceUpdate {
 pub struct AppState {
     pub db: SqlitePool,
     pub token: Option<String>,
+    pub audit: bool,
 }
 
 async fn auth_middleware(
@@ -114,7 +117,7 @@ pub fn create_app(state: AppState) -> Router {
 #[cfg(test)]
 pub async fn create_test_app() -> Router {
     let db = db::init_test_db().await.unwrap();
-    let state = AppState { db, token: None };
+    let state = AppState { db, token: None, audit: false };
     create_app(state)
 }
 
@@ -133,25 +136,49 @@ async fn list_messages(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let one_hour_ago = Utc::now() - Duration::hours(1);
-    let cutoff_iso = one_hour_ago.to_rfc3339();
-
-    let rows = sqlx::query(
-        r#"
-        SELECT id, hash, sender, recipient, content, refs, timestamp
-        FROM messages
-        WHERE (recipient = ? OR recipient = 'all') AND timestamp >= ?
-        ORDER BY timestamp DESC
-        "#,
-    )
-    .bind(&instance_id)
-    .bind(&cutoff_iso)
-    .fetch_all(&state.db)
-    .await
+    let rows = if state.audit {
+        sqlx::query(
+            r#"
+            SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+            FROM messages
+            WHERE (recipient = ? OR recipient = 'all')
+            ORDER BY timestamp DESC
+            "#,
+        )
+        .bind(&instance_id)
+        .fetch_all(&state.db)
+        .await
+    } else {
+        let cutoff_iso = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        sqlx::query(
+            r#"
+            SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+            FROM messages
+            WHERE (recipient = ? OR recipient = 'all') AND timestamp >= ?
+            ORDER BY timestamp DESC
+            "#,
+        )
+        .bind(&instance_id)
+        .bind(&cutoff_iso)
+        .fetch_all(&state.db)
+        .await
+    }
     .map_err(|e| {
         tracing::error!("Database error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    // In audit mode stamp read_at on messages being seen for the first time.
+    if state.audit {
+        let now = Utc::now().to_rfc3339();
+        let _ = sqlx::query(
+            "UPDATE messages SET read_at = ? WHERE (recipient = ? OR recipient = 'all') AND read_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&instance_id)
+        .execute(&state.db)
+        .await;
+    }
 
     let messages = parse_message_rows(rows);
     Ok(Json(messages))
@@ -165,22 +192,35 @@ async fn get_history(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let one_hour_ago = Utc::now() - Duration::hours(1);
-    let cutoff_iso = one_hour_ago.to_rfc3339();
-
-    let rows = sqlx::query(
-        r#"
-        SELECT id, hash, sender, recipient, content, refs, timestamp
-        FROM messages
-        WHERE (recipient = ? OR sender = ?) AND timestamp >= ?
-        ORDER BY timestamp ASC
-        "#,
-    )
-    .bind(&instance_id)
-    .bind(&instance_id)
-    .bind(&cutoff_iso)
-    .fetch_all(&state.db)
-    .await
+    let rows = if state.audit {
+        sqlx::query(
+            r#"
+            SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+            FROM messages
+            WHERE (recipient = ? OR sender = ?)
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .bind(&instance_id)
+        .bind(&instance_id)
+        .fetch_all(&state.db)
+        .await
+    } else {
+        let cutoff_iso = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        sqlx::query(
+            r#"
+            SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+            FROM messages
+            WHERE (recipient = ? OR sender = ?) AND timestamp >= ?
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .bind(&instance_id)
+        .bind(&instance_id)
+        .bind(&cutoff_iso)
+        .fetch_all(&state.db)
+        .await
+    }
     .map_err(|e| {
         tracing::error!("Database error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -407,12 +447,17 @@ async fn create_message(
         content: payload.content,
         refs: payload.refs,
         timestamp,
+        read_at: None,
     }))
 }
 
 async fn cleanup_old_messages(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.audit {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let one_hour_ago = Utc::now() - Duration::hours(1);
     let cutoff_iso = one_hour_ago.to_rfc3339();
 
@@ -454,6 +499,12 @@ fn parse_message_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Message> {
                 .ok()?
                 .with_timezone(&Utc);
 
+            let read_at = row.try_get::<Option<String>, _>("read_at")
+                .ok()
+                .flatten()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+
             Some(Message {
                 id: row.get("id"),
                 hash: row.get("hash"),
@@ -462,6 +513,7 @@ fn parse_message_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Message> {
                 content: row.get("content"),
                 refs,
                 timestamp,
+                read_at,
             })
         })
         .collect()

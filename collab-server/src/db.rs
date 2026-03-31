@@ -22,12 +22,18 @@ pub async fn init_db() -> Result<SqlitePool> {
             recipient TEXT NOT NULL,
             content TEXT NOT NULL,
             refs TEXT NOT NULL,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            read_at TEXT
         )
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // Migrate existing installs — ignored if column already exists.
+    let _ = sqlx::query("ALTER TABLE messages ADD COLUMN read_at TEXT")
+        .execute(&pool)
+        .await;
 
     sqlx::query(
         r#"
@@ -71,7 +77,8 @@ pub async fn init_test_db() -> Result<SqlitePool> {
             recipient TEXT NOT NULL,
             content TEXT NOT NULL,
             refs TEXT NOT NULL,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            read_at TEXT
         )
         "#,
     )
