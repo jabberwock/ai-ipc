@@ -69,6 +69,26 @@ fn is_stdout_tty() -> bool {
     false
 }
 
+// ── Stream singleton guard ────────────────────────────────────────────────────
+
+fn stream_lock_path(instance_id: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE").ok();
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").ok();
+    home.map(|h| PathBuf::from(h).join(format!(".collab_stream_{}.pid", instance_id)))
+}
+
+/// RAII guard that removes the stream lockfile on drop.
+struct LockGuard(Option<PathBuf>);
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 // ── Read-state persistence ────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -182,6 +202,9 @@ impl CollabClient {
 
         // Filter out control signals — they're internal plumbing, not human messages.
         messages.retain(|m| m.content.trim() != STOP_WATCH_SIGNAL);
+
+        // Filter out self-broadcasts — you sent them, you don't need to read them back.
+        messages.retain(|m| !(m.sender == self.instance_id && m.recipient == "all"));
 
         let mut state = load_read_state();
         let last_read = state.last_read.get(&self.instance_id).copied();
@@ -362,6 +385,7 @@ impl CollabClient {
                 }
                 let mut messages = all_messages;
                 messages.retain(|m| m.content.trim() != STOP_WATCH_SIGNAL);
+                messages.retain(|m| !(m.sender == self.instance_id && m.recipient == "all"));
                 if let Some(since) = last_read {
                     messages.retain(|m| m.timestamp > since);
                 }
@@ -511,6 +535,9 @@ impl CollabClient {
         }
         let role_str = effective_role.as_deref();
 
+        eprintln!("⚠  collab watch is deprecated — use `collab stream` instead.");
+        eprintln!("   collab stream delivers messages instantly via SSE with zero polling.");
+        eprintln!();
         println!("Watching for messages to @{} (polling every {}s)", self.instance_id, interval_secs);
         if !recipients.is_empty() {
             println!("Waiting for: {}", recipients.iter().map(|r| format!("@{}", r)).collect::<Vec<_>>().join(", "));
@@ -609,6 +636,29 @@ impl CollabClient {
 
     pub async fn stream_messages(&self, role: Option<String>) -> Result<()> {
         use tokio::time::{sleep, Duration};
+
+        // Singleton guard: prevent multiple stream processes for the same instance.
+        let _lock_guard = if let Some(path) = stream_lock_path(&self.instance_id) {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = contents.trim().parse::<u32>() {
+                    #[cfg(unix)]
+                    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                    #[cfg(not(unix))]
+                    let alive = false;
+                    if alive {
+                        anyhow::bail!(
+                            "collab stream is already running for @{} (PID {})\n\
+                             Kill it first:  kill {}",
+                            self.instance_id, pid, pid
+                        );
+                    }
+                }
+            }
+            let _ = std::fs::write(&path, std::process::id().to_string());
+            LockGuard(Some(path))
+        } else {
+            LockGuard(None)
+        };
 
         // Ignore SIGHUP so the stream survives being backgrounded or the
         // controlling terminal closing (e.g. `collab stream &`, nohup-less).

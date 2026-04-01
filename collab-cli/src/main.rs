@@ -150,7 +150,10 @@ enum Commands {
         refs: Option<String>,
     },
 
-    /// Poll for new messages, heartbeat presence, and watch for configured recipients
+    /// [DEPRECATED] Poll for new messages — use `collab stream` instead
+    ///
+    /// collab stream delivers messages instantly via SSE with zero polling and
+    /// survives backgrounding. collab watch is kept for compatibility only.
     Watch {
         /// Polling interval in seconds (default: 10)
         #[arg(short, long, default_value = "10")]
