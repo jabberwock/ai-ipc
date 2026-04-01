@@ -1,2 +1,9 @@
+.claude
+.cursor
+.vscode
+.idea
+.DS_Store
+tmp
 node_modules/
 .worker-state.json
+target
