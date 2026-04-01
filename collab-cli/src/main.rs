@@ -6,6 +6,7 @@ use std::path::PathBuf;
 mod client;
 mod init;
 mod worker;
+mod lifecycle;
 #[cfg(feature = "monitor")]
 mod monitor;
 #[cfg(feature = "monitor")]
@@ -280,6 +281,30 @@ enum Commands {
         #[arg(long, value_name = "MS")]
         batch_wait: Option<u64>,
     },
+
+    /// Start worker process(es) in background
+    Start {
+        /// Which worker(s) to start: 'all' or '@name'
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+
+    /// Stop running worker process(es)
+    Stop {
+        /// Which worker(s) to stop: 'all' or '@name'
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+
+    /// Stop and restart worker process(es)
+    Restart {
+        /// Which worker(s) to restart: 'all' or '@name'
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
+
+    /// Show running worker processes
+    LifecycleStatus,
 }
 
 #[tokio::main]
@@ -348,6 +373,22 @@ async fn main() -> Result<()> {
         );
         harness.run().await?;
         return Ok(());
+    }
+
+    if let Commands::Start { target } = cli.command {
+        return lifecycle_start(&target).await;
+    }
+
+    if let Commands::Stop { target } = cli.command {
+        return lifecycle_stop(&target).await;
+    }
+
+    if let Commands::Restart { target } = cli.command {
+        return lifecycle_restart(&target).await;
+    }
+
+    if matches!(cli.command, Commands::LifecycleStatus) {
+        return lifecycle_status().await;
     }
 
     if matches!(cli.command, Commands::Roster) {
@@ -447,11 +488,190 @@ async fn main() -> Result<()> {
             .join()
             .unwrap_or_else(|_| Err(anyhow::anyhow!("monitor panicked")))?;
         }
-        Commands::Roster | Commands::ConfigPath | Commands::Init { .. } => unreachable!(),
+        Commands::Roster | Commands::ConfigPath | Commands::Init { .. } | Commands::Start { .. } | Commands::Stop { .. } | Commands::Restart { .. } | Commands::LifecycleStatus => unreachable!(),
         #[allow(unreachable_patterns)]
         #[allow(unreachable_patterns)]
         _ => unreachable!(),
     }
 
     Ok(())
+}
+
+/// SECURITY: Parse target string, preventing injection
+fn parse_target(target: &str) -> Result<Vec<String>> {
+    let target = target.trim();
+    if target == "all" {
+        // Will be expanded using manifest
+        Ok(vec!["all".to_string()])
+    } else if target.starts_with('@') {
+        // Single instance
+        let name = &target[1..];
+        if name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            Ok(vec![name.to_string()])
+        } else {
+            Err(anyhow::anyhow!("Invalid instance name: {}", name))
+        }
+    } else if target.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        // Instance name without @
+        Ok(vec![target.to_string()])
+    } else {
+        Err(anyhow::anyhow!("Invalid target: {}", target))
+    }
+}
+
+async fn lifecycle_start(target: &str) -> Result<()> {
+    let targets = parse_target(target)?;
+    let manifest_path = find_manifest()?;
+    let manifest = lifecycle::read_manifest(&manifest_path)?;
+
+    let pids_file = manifest_path.parent().unwrap().join("workers.pids");
+
+    // Determine which workers to start
+    let workers = if targets[0] == "all" {
+        manifest.clone()
+    } else {
+        manifest.into_iter()
+            .filter(|w| targets.contains(&w.name))
+            .collect()
+    };
+
+    if workers.is_empty() {
+        println!("No matching workers found");
+        return Ok(());
+    }
+
+    for worker in workers {
+        // Read env vars from manifest parent .collab.toml if needed
+        // For now, use env vars from environment
+        let token = std::env::var("COLLAB_TOKEN")
+            .or_else(|_| {
+                // Try to read from manifest dir if it exists
+                let manifest_dir = manifest_path.parent().unwrap();
+                if let Ok(content) = std::fs::read_to_string(manifest_dir.join(".collab.toml")) {
+                    // Parse token from TOML (simplified)
+                    content.lines()
+                        .find_map(|line| {
+                            if line.starts_with("token") {
+                                line.split('=').nth(1)
+                                    .map(|s| s.trim().trim_matches('"').to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("token not found"))
+                } else {
+                    Err(anyhow::anyhow!("COLLAB_TOKEN not set"))
+                }
+            })?;
+
+        let server = std::env::var("COLLAB_SERVER").unwrap_or_else(|_| "http://localhost:8000".to_string());
+
+        let workdir = std::path::PathBuf::from(&worker.codebase_path);
+        let child = lifecycle::spawn_worker(
+            &worker.name,
+            &workdir,
+            &worker.model,
+            &worker.name,
+            &server,
+            &token,
+        )?;
+
+        let pid = child.id();
+        let cmd = format!("collab worker --workdir {} --model {}", worker.codebase_path, worker.model);
+        lifecycle::save_worker_pid(&pids_file, &worker.name, pid, &cmd)?;
+
+        // Detach the child process
+        std::mem::drop(child);
+    }
+
+    println!("✓ Workers started. Check status with: collab lifecycle-status");
+    Ok(())
+}
+
+async fn lifecycle_stop(target: &str) -> Result<()> {
+    let targets = parse_target(target)?;
+    let manifest_path = find_manifest()?;
+    let _manifest = lifecycle::read_manifest(&manifest_path)?;
+
+    let pids_file = manifest_path.parent().unwrap().join("workers.pids");
+
+    // Read current PIDs
+    let mut state: std::collections::HashMap<String, lifecycle::WorkerState> = if pids_file.exists() {
+        let content = std::fs::read_to_string(&pids_file)?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        println!("No running workers found");
+        return Ok(());
+    };
+
+    // Determine which workers to stop
+    let workers_to_stop: Vec<String> = if targets[0] == "all" {
+        state.keys().cloned().collect()
+    } else {
+        targets.iter()
+            .filter(|t| state.contains_key(*t))
+            .cloned()
+            .collect()
+    };
+
+    if workers_to_stop.is_empty() {
+        println!("No matching running workers found");
+        return Ok(());
+    }
+
+    for name in &workers_to_stop {
+        if let Some(worker_state) = state.remove(name) {
+            lifecycle::kill_process(worker_state.pid, name)?;
+            lifecycle::remove_worker_pid(&pids_file, name)?;
+        }
+    }
+
+    println!("✓ Workers stopped");
+    Ok(())
+}
+
+async fn lifecycle_restart(target: &str) -> Result<()> {
+    lifecycle_stop(target).await?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    lifecycle_start(target).await?;
+    Ok(())
+}
+
+async fn lifecycle_status() -> Result<()> {
+    let manifest_path = find_manifest()?;
+    let pids_file = manifest_path.parent().unwrap().join("workers.pids");
+
+    if !pids_file.exists() {
+        println!("No workers running");
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&pids_file)?;
+    let state: std::collections::HashMap<String, lifecycle::WorkerState> = serde_json::from_str(&content)?;
+
+    println!("Running workers:");
+    for (name, worker_state) in &state {
+        println!("  {} (PID: {})", name, worker_state.pid);
+        println!("    Started: {}", worker_state.started_at);
+        println!("    Command: {}", worker_state.command);
+    }
+
+    Ok(())
+}
+
+fn find_manifest() -> Result<std::path::PathBuf> {
+    // Look for .collab/workers.json in current dir or parents
+    let mut current = std::env::current_dir()?;
+    loop {
+        let manifest = current.join(".collab/workers.json");
+        if manifest.exists() {
+            return Ok(manifest);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Manifest not found. Run 'collab init workers.yml' in your project directory"
+    ))
 }

@@ -1,6 +1,10 @@
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::fs;
+
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, MetadataExt as _};
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ProjectConfig {
@@ -9,7 +13,14 @@ pub struct ProjectConfig {
     pub output_dir: Option<String>,
     /// Path to the shared codebase that workers will exec from (e.g., ~/code/claude-ipc)
     pub codebase_path: Option<String>,
+    /// Default Claude model for all workers (e.g., haiku, sonnet) — can be overridden per-worker
+    #[serde(default = "default_model")]
+    pub model: String,
     pub workers: Vec<WorkerConfig>,
+}
+
+fn default_model() -> String {
+    "haiku".to_string()
 }
 
 fn default_server() -> String {
@@ -25,11 +36,13 @@ pub struct WorkerConfig {
     pub avatar: Option<String>,
     /// Accent color index 0–4: cyan, violet, emerald, amber, rose (auto-assigned if omitted)
     pub color: Option<u8>,
+    /// Claude model for this worker (e.g., haiku, sonnet) — overrides project default if set
+    pub model: Option<String>,
 }
 
 impl ProjectConfig {
-    pub fn new(server: String, output_dir: Option<String>, codebase_path: Option<String>, workers: Vec<WorkerConfig>) -> Self {
-        Self { server, output_dir, codebase_path, workers }
+    pub fn new(server: String, output_dir: Option<String>, codebase_path: Option<String>, model: String, workers: Vec<WorkerConfig>) -> Self {
+        Self { server, output_dir, codebase_path, model, workers }
     }
 }
 
@@ -57,11 +70,15 @@ pub fn generate(config: &ProjectConfig, output_dir_override: Option<&str>) -> Re
     for worker in &config.workers {
         let dir = base.join(&worker.name);
         std::fs::create_dir_all(&dir)?;
-        let md = render_claude_md(worker, &config.workers, &config.server, &config.codebase_path);
+        let worker_model = worker.model.as_ref().unwrap_or(&config.model).clone();
+        let md = render_claude_md(worker, &config.workers, &config.server, &config.codebase_path, &worker_model);
         let path = dir.join("CLAUDE.md");
         std::fs::write(&path, md)?;
         println!("  ✓  {}", path.display());
     }
+
+    // Write worker manifest to .collab/workers.json
+    write_worker_manifest(base, config)?;
 
     // Write dashboard-config.json for avatar/color presets
     let mut entries = Vec::new();
@@ -88,7 +105,7 @@ pub fn generate(config: &ProjectConfig, output_dir_override: Option<&str>) -> Re
     Ok(())
 }
 
-fn render_claude_md(worker: &WorkerConfig, all: &[WorkerConfig], server: &str, codebase_path: &Option<String>) -> String {
+fn render_claude_md(worker: &WorkerConfig, all: &[WorkerConfig], server: &str, codebase_path: &Option<String>, model: &str) -> String {
     let teammates: Vec<&WorkerConfig> = all.iter().filter(|w| w.name != worker.name).collect();
 
     let team_table = if teammates.is_empty() {
@@ -137,8 +154,8 @@ fn render_claude_md(worker: &WorkerConfig, all: &[WorkerConfig], server: &str, c
 
     let workdir_cmd = codebase_path
         .as_ref()
-        .map(|p| format!("collab worker --workdir {} --model haiku", p))
-        .unwrap_or_else(|| "collab worker --workdir <path-to-shared-codebase> --model haiku".to_string());
+        .map(|p| format!("collab worker --workdir {} --model {}", p, model))
+        .unwrap_or_else(|| format!("collab worker --workdir <path-to-shared-codebase> --model {}", model));
 
     format!(
         r#"# {name} — Collab Worker
@@ -288,4 +305,52 @@ Follow these without exception:
         tasks_section = tasks_section,
         workdir_cmd = workdir_cmd,
     )
+}
+
+/// Manifest entry for a single worker (used by lifecycle commands)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkerManifestEntry {
+    pub name: String,
+    pub role: String,
+    pub codebase_path: String,
+    pub model: String,
+    pub output_dir: String,
+}
+
+/// Write .collab/workers.json manifest for lifecycle management
+fn write_worker_manifest(base: &Path, config: &ProjectConfig) -> Result<()> {
+    let collab_dir = base.join(".collab");
+    fs::create_dir_all(&collab_dir)?;
+
+    let mut manifest_entries = Vec::new();
+    for worker in &config.workers {
+        let worker_model = worker.model.as_ref().unwrap_or(&config.model).clone();
+        let codebase_path = config.codebase_path.as_ref()
+            .map(|p| p.clone())
+            .unwrap_or_else(|| "<codebase_path-not-configured>".to_string());
+
+        manifest_entries.push(WorkerManifestEntry {
+            name: worker.name.clone(),
+            role: worker.role.clone(),
+            codebase_path,
+            model: worker_model,
+            output_dir: base.join(&worker.name).to_string_lossy().to_string(),
+        });
+    }
+
+    let manifest_json = serde_json::to_string_pretty(&manifest_entries)?;
+    let manifest_path = collab_dir.join("workers.json");
+
+    fs::write(&manifest_path, manifest_json)?;
+
+    // Set permissions to 0600 (user read/write only) — SECURITY
+    #[cfg(unix)]
+    {
+        let perms = std::os::unix::fs::PermissionsExt::from_mode(0o600);
+        fs::set_permissions(&manifest_path, perms)?;
+    }
+
+    println!("  ✓  {} (manifest for lifecycle commands)", manifest_path.display());
+
+    Ok(())
 }
