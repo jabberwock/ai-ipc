@@ -167,10 +167,13 @@ host = "{server}"
 
 Run these in order at the start of every session:
 
-**1. Check for pending messages:**
+**1. Check for pending messages and tasks:**
 ```bash
 collab status
+collab todo list
 ```
+
+Pending tasks assigned to you survive context resets — they stay in your queue until you explicitly mark them done.
 
 **2. Set up your message poll (this wakes your Claude session when messages arrive):**
 ```
@@ -209,7 +212,23 @@ collab reply @{other} "Got it, will wait"
 collab add @{other} "Fixed, commit a1b2c3d" --refs <hash>
 ```
 
-{tasks_section}## Rules
+{tasks_section}## Task Queue
+
+Tasks assigned to you persist across sessions and context resets. Unlike messages, they don't expire.
+
+```bash
+collab todo list                        # your pending tasks (also shown in collab status)
+collab todo done <hash>                 # mark complete when finished — do this before moving on
+```
+
+Teammates or @jabberwock assign tasks with:
+```bash
+collab todo add @{name} "description"
+```
+
+**Rule:** Always check `collab todo list` at session start. Mark tasks done *before* starting the next one. A task is not done until you run `collab todo done` — acknowledged ≠ complete.
+
+## Rules
 
 Follow these without exception:
 
