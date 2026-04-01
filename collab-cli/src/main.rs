@@ -98,6 +98,34 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum TodoAction {
+    /// Assign a task to an instance
+    Add {
+        /// Target instance (e.g., @worker or worker)
+        #[arg(value_name = "@INSTANCE")]
+        instance: String,
+
+        /// Task description
+        #[arg(value_name = "DESCRIPTION")]
+        description: String,
+    },
+
+    /// List pending tasks (defaults to your own instance)
+    List {
+        /// Show tasks for a specific instance instead of yourself
+        #[arg(value_name = "@INSTANCE")]
+        instance: Option<String>,
+    },
+
+    /// Mark a task complete
+    Done {
+        /// Hash prefix of the task (at least 4 chars)
+        #[arg(value_name = "HASH")]
+        hash: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// List messages intended for this instance (unread by default)
     List {
@@ -205,6 +233,12 @@ enum Commands {
 
     /// Print the path to the config file
     ConfigPath,
+
+    /// Manage persistent task queue (survives context resets)
+    Todo {
+        #[command(subcommand)]
+        action: TodoAction,
+    },
 
     /// Set up worker environments from a YAML config (or interactive wizard)
     ///
@@ -345,6 +379,19 @@ async fn main() -> Result<()> {
             let filter_id = filter.as_deref().map(|s| s.trim_start_matches('@'));
             client.show_history(filter_id).await?;
         }
+        Commands::Todo { action } => match action {
+            TodoAction::Add { instance, description } => {
+                let instance = instance.trim_start_matches('@');
+                client.todo_add(instance, &description).await?;
+            }
+            TodoAction::List { instance } => {
+                let instance = instance.as_deref().map(|s| s.trim_start_matches('@'));
+                client.todo_list(instance).await?;
+            }
+            TodoAction::Done { hash } => {
+                client.todo_done(&hash).await?;
+            }
+        },
         #[cfg(feature = "monitor")]
         Commands::Monitor { interval } => {
             let server2 = server.clone();

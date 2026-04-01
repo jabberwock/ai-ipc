@@ -5,7 +5,7 @@ use axum::{
     http::{self, StatusCode},
     middleware::Next,
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -25,6 +25,7 @@ const MAX_ROLE_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 4096;
 const MAX_REFS_COUNT: usize = 20;
 const MAX_REF_LEN: usize = 64;
+const MAX_TODO_DESC_LEN: usize = 512;
 
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
@@ -55,6 +56,25 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TodoCreate {
+    pub assigned_by: String,
+    pub instance: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: String,
+    pub hash: String,
+    pub instance: String,
+    pub assigned_by: String,
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,6 +148,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/presence/:instance_id", delete(delete_presence))
         .route("/messages/cleanup", delete(cleanup_old_messages))
         .route("/metrics", get(get_metrics))
+        .route("/todos", post(create_todo))
+        .route("/todos/:instance_id", get(list_todos))
+        .route("/todos/:hash/done", patch(complete_todo))
         .layer(TimeoutLayer::with_status_code(http::StatusCode::REQUEST_TIMEOUT, StdDuration::from_secs(30)));
 
     // SSE routes — no timeout, connections stay open indefinitely
@@ -636,6 +659,169 @@ async fn cleanup_old_messages(
     Ok(Json(serde_json::json!({
         "deleted": result.rows_affected()
     })))
+}
+
+async fn create_todo(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<TodoCreate>,
+) -> Result<Json<Todo>, StatusCode> {
+    if payload.assigned_by.len() > MAX_INSTANCE_ID_LEN
+        || payload.instance.len() > MAX_INSTANCE_ID_LEN
+        || !is_valid_identifier(&payload.assigned_by)
+        || !is_valid_identifier(&payload.instance)
+        || payload.description.is_empty()
+        || payload.description.len() > MAX_TODO_DESC_LEN
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let now = Utc::now();
+    let now_iso = now.to_rfc3339();
+
+    let mut hasher = Sha1::new();
+    hasher.update(payload.instance.as_bytes());
+    hasher.update(b"|");
+    hasher.update(payload.assigned_by.as_bytes());
+    hasher.update(b"|");
+    hasher.update(payload.description.as_bytes());
+    hasher.update(b"|");
+    hasher.update(now_iso.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+
+    let id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        r#"
+        INSERT INTO todos (id, hash, instance, assigned_by, description, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&id)
+    .bind(&hash)
+    .bind(&payload.instance)
+    .bind(&payload.assigned_by)
+    .bind(&payload.description)
+    .bind(&now_iso)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(Todo {
+        id,
+        hash,
+        instance: payload.instance,
+        assigned_by: payload.assigned_by,
+        description: payload.description,
+        created_at: now,
+        completed_at: None,
+    }))
+}
+
+async fn list_todos(
+    Path(instance_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<Todo>>, StatusCode> {
+    if instance_id.len() > MAX_INSTANCE_ID_LEN || !is_valid_identifier(&instance_id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, hash, instance, assigned_by, description, created_at, completed_at
+        FROM todos
+        WHERE instance = ? AND completed_at IS NULL
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(&instance_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let todos = parse_todo_rows(rows);
+    Ok(Json(todos))
+}
+
+async fn complete_todo(
+    Path(hash_prefix): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, StatusCode> {
+    if hash_prefix.len() < 4 || hash_prefix.len() > 40 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    // Ensure only hex chars
+    if !hash_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let pattern = format!("{}%", hash_prefix);
+    let now_iso = Utc::now().to_rfc3339();
+
+    // Atomic: only update if not already completed — returns 409 on double-complete
+    let result = sqlx::query(
+        r#"
+        UPDATE todos SET completed_at = ?
+        WHERE hash LIKE ? AND completed_at IS NULL
+        "#,
+    )
+    .bind(&now_iso)
+    .bind(&pattern)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match result.rows_affected() {
+        0 => {
+            // Check if it exists at all (already completed vs not found)
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM todos WHERE hash LIKE ?")
+                .bind(&pattern)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or(0);
+            if exists > 0 {
+                Err(StatusCode::CONFLICT) // 409 — already completed
+            } else {
+                Err(StatusCode::NOT_FOUND)
+            }
+        }
+        _ => Ok(StatusCode::NO_CONTENT),
+    }
+}
+
+fn parse_todo_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Todo> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let created_str: String = row.get("created_at");
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .ok()?
+                .with_timezone(&Utc);
+
+            let completed_at = row.try_get::<Option<String>, _>("completed_at")
+                .ok()
+                .flatten()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+
+            Some(Todo {
+                id: row.get("id"),
+                hash: row.get("hash"),
+                instance: row.get("instance"),
+                assigned_by: row.get("assigned_by"),
+                description: row.get("description"),
+                created_at,
+                completed_at,
+            })
+        })
+        .collect()
 }
 
 fn parse_message_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Message> {

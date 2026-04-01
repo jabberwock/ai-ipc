@@ -149,6 +149,17 @@ pub struct WorkerInfo {
     pub message_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: String,
+    pub hash: String,
+    pub instance: String,
+    pub assigned_by: String,
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone)]
 pub struct CollabClient {
     base_url: String,
@@ -337,12 +348,17 @@ impl CollabClient {
     }
 
     pub async fn show_status(&self) -> Result<()> {
-        let (roster_r, messages_r) = tokio::join!(
+        let todos_url = format!("{}/todos/{}", self.base_url, self.instance_id);
+        let (roster_r, messages_r, todos_r) = tokio::join!(
             self.fetch_roster_pub(),
             async {
                 let url = format!("{}/messages/{}", self.base_url, self.instance_id);
                 let resp = self.auth(self.client.get(&url)).send().await?;
                 resp.json::<Vec<Message>>().await.map_err(anyhow::Error::from)
+            },
+            async {
+                let resp = self.auth(self.client.get(&todos_url)).send().await?;
+                resp.json::<Vec<Todo>>().await.map_err(anyhow::Error::from)
             }
         );
 
@@ -410,6 +426,20 @@ impl CollabClient {
                 }
             }
             Err(e) => eprintln!("Warning: could not fetch messages: {}", e),
+        }
+
+        // Pending todos
+        match todos_r {
+            Ok(todos) if !todos.is_empty() => {
+                println!("Pending tasks for @{}:\n", self.instance_id);
+                for todo in &todos {
+                    println!("  {}  {}", &todo.hash[..7], todo.description);
+                    println!("  from @{}  —  {}", todo.assigned_by, todo.created_at.format("%Y-%m-%d %H:%M UTC"));
+                    println!();
+                }
+            }
+            Ok(_) => {} // no todos — silent
+            Err(_) => {} // server may not support todos yet — silent
         }
 
         Ok(())
@@ -843,6 +873,82 @@ impl CollabClient {
         println!("─────────────────────────────────────");
 
         Ok(())
+    }
+
+    pub async fn todo_add(&self, instance: &str, description: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct TodoCreate {
+            assigned_by: String,
+            instance: String,
+            description: String,
+        }
+
+        let payload = TodoCreate {
+            assigned_by: self.instance_id.clone(),
+            instance: instance.to_string(),
+            description: description.to_string(),
+        };
+
+        let url = format!("{}/todos", self.base_url);
+        let resp = self.auth(self.client.post(&url)).json(&payload).send().await?;
+
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            anyhow::bail!("Bad request — check instance ID and description length");
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("Server error: {}", resp.status());
+        }
+
+        let todo: Todo = resp.json().await?;
+        println!("→ @{}  {}", todo.instance, &todo.hash[..7]);
+        println!("  {}", todo.description);
+        Ok(())
+    }
+
+    pub async fn todo_list(&self, instance: Option<&str>) -> Result<()> {
+        let target = instance.unwrap_or(&self.instance_id);
+        let url = format!("{}/todos/{}", self.base_url, target);
+        let resp = self.auth(self.client.get(&url)).send().await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Server error: {}", resp.status());
+        }
+
+        let todos: Vec<Todo> = resp.json().await?;
+
+        if todos.is_empty() {
+            println!("No pending tasks for @{}.", target);
+            return Ok(());
+        }
+
+        println!("Pending tasks for @{}:\n", target);
+        for todo in &todos {
+            println!("─────────────────────────────────────");
+            println!("  {}  (from @{})", &todo.hash[..7], todo.assigned_by);
+            println!("  {}", todo.description);
+            println!("  Assigned: {}", todo.created_at.format("%Y-%m-%d %H:%M UTC"));
+        }
+        println!("─────────────────────────────────────");
+        Ok(())
+    }
+
+    pub async fn todo_done(&self, hash_prefix: &str) -> Result<()> {
+        let url = format!("{}/todos/{}/done", self.base_url, hash_prefix);
+        let resp = self.auth(self.client.patch(&url)).send().await?;
+
+        match resp.status() {
+            s if s == reqwest::StatusCode::NO_CONTENT => {
+                println!("✓  Task {} marked complete.", hash_prefix);
+                Ok(())
+            }
+            s if s == reqwest::StatusCode::CONFLICT => {
+                anyhow::bail!("Task {} already completed (409).", hash_prefix)
+            }
+            s if s == reqwest::StatusCode::NOT_FOUND => {
+                anyhow::bail!("Task {} not found.", hash_prefix)
+            }
+            s => anyhow::bail!("Server error: {}", s),
+        }
     }
 
     pub async fn show_roster(&self) -> Result<()> {

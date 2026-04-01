@@ -56,6 +56,31 @@ pub async fn init_db() -> Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS todos (
+            id TEXT PRIMARY KEY,
+            hash TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            assigned_by TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_todos_instance
+        ON todos(instance, created_at DESC)
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 
@@ -101,6 +126,31 @@ pub async fn init_test_db() -> Result<SqlitePool> {
             role TEXT NOT NULL DEFAULT '',
             last_seen TEXT NOT NULL
         )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS todos (
+            id TEXT PRIMARY KEY,
+            hash TEXT NOT NULL,
+            instance TEXT NOT NULL,
+            assigned_by TEXT NOT NULL,
+            description TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_todos_instance
+        ON todos(instance, created_at DESC)
         "#,
     )
     .execute(&pool)
