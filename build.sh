@@ -3,8 +3,8 @@ set -e
 
 echo "Building and installing collab..."
 
-# Workers: build without monitor (no textual-rs needed)
-# Add --features monitor if you want the live TUI monitor (requires textual-rs source)
+# Default: build without monitor (works on Rust 1.85+, no textual-rs needed)
+# Add --features monitor if you want the live TUI monitor (requires Rust 1.88+)
 cargo install --path collab-cli
 cargo install --path collab-server
 
