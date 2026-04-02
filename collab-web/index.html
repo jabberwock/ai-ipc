@@ -1034,15 +1034,21 @@ function renderFeed() {
   const me    = document.getElementById('compose-name').value.trim();
   const all   = getAllMsgs();
 
-  // Update @mentions badge — only count unseen mentions
-  if (!S._seenMentions) S._seenMentions = new Set();
+  // Update @mentions badge — persist seen mentions in localStorage
+  const seenKey = 'collab-seen-mentions';
+  if (!S._seenMentions) {
+    try { S._seenMentions = new Set(JSON.parse(localStorage.getItem(seenKey) || '[]')); }
+    catch { S._seenMentions = new Set(); }
+  }
   const myMentions = me ? all.filter(m => m.recipient === me || m.recipient === 'all') : [];
-  const unseenMentions = myMentions.filter(m => !S._seenMentions.has(m.id));
   // If we're viewing mentions tab, mark all as seen
-  if (S.inboxMode) myMentions.forEach(m => S._seenMentions.add(m.id));
-  const mentionCount = S.inboxMode ? 0 : unseenMentions.length;
+  if (S.inboxMode) {
+    myMentions.forEach(m => S._seenMentions.add(m.id));
+    localStorage.setItem(seenKey, JSON.stringify([...S._seenMentions]));
+  }
+  const unseenMentions = myMentions.filter(m => !S._seenMentions.has(m.id));
   const badge = document.getElementById('inbox-badge');
-  badge.textContent = mentionCount || '';
+  badge.textContent = unseenMentions.length || '';
 
   let msgs = S.inboxMode ? all.filter(m => m.recipient === me || m.recipient === 'all') : all;
 
