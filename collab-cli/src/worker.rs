@@ -403,11 +403,11 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
         // Parse structured output
         if let Some(collab_output) = self.parse_collab_output(&stdout) {
             // Send response once per unique sender (skip self)
+            let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
             if let Some(response) = &collab_output.response {
                 if !response.is_empty() {
-                    let mut replied: std::collections::HashSet<&str> = std::collections::HashSet::new();
                     for msg in messages {
-                        if msg.sender != self.instance_id && replied.insert(&msg.sender) {
+                        if msg.sender != self.instance_id && replied.insert(msg.sender.clone()) {
                             if let Err(e) = self.client.add_message(&msg.sender, response, None).await {
                                 self.log_error(&format!("Failed to send response to @{}: {}", msg.sender, e));
                             }
@@ -443,12 +443,13 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
                 }
             }
 
-            // Pipeline: auto-dispatch to downstream workers
+            // Pipeline: auto-dispatch to downstream workers (skip those already replied to)
             if !collab_output.completed_tasks.is_empty() && !self.hands_off_to.is_empty() {
                 let summary = collab_output.response.as_deref().unwrap_or("Task completed.");
                 let handoff_msg = format!("Completed work from @{}: {}", self.instance_id, summary);
                 for downstream in &self.hands_off_to {
                     let to = downstream.trim_start_matches('@');
+                    if replied.contains(to) { continue; }
                     if let Err(e) = self.client.add_message(to, &handoff_msg, None).await {
                         self.log_error(&format!("Failed to route to @{}: {}", to, e));
                     } else {
@@ -493,12 +494,30 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
     }
 
     fn parse_collab_output(&self, output: &str) -> Option<CollabOutput> {
-        // Find the first { and last } — extract JSON from any surrounding text
-        let start = output.find('{')?;
-        let end = output.rfind('}')?;
-        if end <= start { return None; }
-        let json_str = &output[start..=end];
-        serde_json::from_str(json_str).ok()
+        // Try to find valid CollabOutput JSON — scan from the end backwards
+        // since models often put explanatory text before the JSON
+        let bytes = output.as_bytes();
+        let mut depth = 0i32;
+        let mut end_pos = None;
+
+        // Find the last } that closes a top-level object
+        for i in (0..bytes.len()).rev() {
+            if bytes[i] == b'}' {
+                if depth == 0 { end_pos = Some(i); }
+                depth += 1;
+            } else if bytes[i] == b'{' {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(end) = end_pos {
+                        let json_str = &output[i..=end];
+                        if let Ok(parsed) = serde_json::from_str::<CollabOutput>(json_str) {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn load_state(&self) -> WorkerState {
