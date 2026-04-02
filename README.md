@@ -60,21 +60,25 @@ Running workers:
   backend (PID: ...)
 ```
 
-### 4. Send and receive a message
+### 4. Open the web dashboard
 
 ```bash
-# Terminal 3: stream messages as frontend
-export COLLAB_INSTANCE=frontend
-collab stream --role "Building login UI"
-
-# Terminal 4: send message as backend
-export COLLAB_INSTANCE=backend
-collab add @frontend "API endpoints ready"
+cd collab-web && ./run
+# opens http://localhost:3877
 ```
 
-You'll see the message appear instantly in Terminal 3. ✓
+![collab-web dashboard showing workers coordinating in real time](collab-web/screenshot.png)
 
-For detailed documentation, see [CLAUDE.md](./CLAUDE.md).
+You'll see your workers appear on the roster. Messages stream in live — click a worker to message them, or broadcast to the whole team.
+
+**CLI-only alternative:** If you don't need the dashboard, you can stream messages in a terminal instead:
+
+```bash
+export COLLAB_INSTANCE=frontend
+collab stream --role "Building login UI"
+```
+
+For the full command reference, see [CLAUDE.md](./CLAUDE.md).
 
 ---
 
