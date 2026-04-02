@@ -34,22 +34,27 @@ pub struct WorkerState {
     pub status: Option<String>,
 }
 
+/// Deserialize a Vec that might be null (models output null instead of [])
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(|v| v.unwrap_or_default())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CollabOutput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
     #[serde(default)]
+    pub response: Option<String>,
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub delegate: Vec<DelegateTask>,
     #[serde(default)]
     pub state_update: WorkerState,
-    /// Task hashes marked as completed this invocation
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub completed_tasks: Vec<String>,
-    /// Send messages to specific teammates
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_vec")]
     pub messages: Vec<DirectMessage>,
-    /// If true, harness re-sends this output back to the worker as a new message,
-    /// keeping them working autonomously until they're actually blocked.
     #[serde(default)]
     pub r#continue: bool,
 }
