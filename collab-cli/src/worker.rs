@@ -39,6 +39,9 @@ struct CollabOutput {
     pub delegate: Vec<DelegateTask>,
     #[serde(default)]
     pub state_update: WorkerState,
+    /// Task hashes marked as completed this invocation
+    #[serde(default)]
+    pub completed_tasks: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +59,10 @@ pub struct WorkerHarness {
     batch_wait_ms: u64,
     message_queue: Arc<Mutex<Vec<Message>>>,
     first_message_time: Arc<Mutex<Option<Instant>>>,
+    /// Pipeline: auto-dispatch to these workers on task completion
+    hands_off_to: Vec<String>,
+    /// All teammates (name + role) for prompt injection
+    teammates: Vec<(String, String)>,
 }
 
 impl WorkerHarness {
@@ -66,6 +73,8 @@ impl WorkerHarness {
         model: String,
         auto_reply: bool,
         batch_wait_ms: u64,
+        hands_off_to: Vec<String>,
+        teammates: Vec<(String, String)>,
     ) -> Self {
         Self {
             client: Arc::new(client),
@@ -76,6 +85,8 @@ impl WorkerHarness {
             batch_wait_ms,
             message_queue: Arc::new(Mutex::new(Vec::new())),
             first_message_time: Arc::new(Mutex::new(None)),
+            hands_off_to,
+            teammates,
         }
     }
 
@@ -89,6 +100,8 @@ impl WorkerHarness {
         let workdir = self.workdir.clone();
         let model = self.model.clone();
         let auto_reply = self.auto_reply;
+        let hands_off_to = self.hands_off_to.clone();
+        let teammates = self.teammates.clone();
 
         tokio::spawn(async move {
             loop {
@@ -123,6 +136,8 @@ impl WorkerHarness {
                         batch_wait_ms,
                         message_queue: Arc::new(Mutex::new(Vec::new())),
                         first_message_time: Arc::new(Mutex::new(None)),
+                        hands_off_to: hands_off_to.clone(),
+                        teammates: teammates.clone(),
                     };
                     if let Err(e) = harness.spawn_claude(&messages).await {
                         harness.log_error(&format!("Failed to process {} messages: {}", messages.len(), e));
@@ -243,8 +258,27 @@ impl WorkerHarness {
 
         let state_str = serde_json::to_string_pretty(&state).unwrap_or_else(|_| "No previous state.".to_string());
 
+        // Build teammates section
+        let teammates_str = if self.teammates.is_empty() {
+            "No teammates configured.".to_string()
+        } else {
+            let mut lines = String::from("Your team:\n");
+            for (name, role) in &self.teammates {
+                if name != &self.instance_id {
+                    lines.push_str(&format!("  @{} — {}\n", name, role));
+                }
+            }
+            if !self.hands_off_to.is_empty() {
+                lines.push_str(&format!("\nWhen you complete a task, your work auto-routes to: {}\n",
+                    self.hands_off_to.iter().map(|w| format!("@{}", w)).collect::<Vec<_>>().join(", ")));
+            }
+            lines
+        };
+
         let prompt = format!(
             "You are @{}. Role: {}
+
+{}
 
 Previous state:
 {}
@@ -261,14 +295,21 @@ Instructions: Act on the messages above. Use Bash/Read/Write/Edit to do your act
 {{
   \"response\": \"your reply to the sender (string or null)\",
   \"delegate\": [{{\"to\": \"@worker\", \"task\": \"description\"}}],
+  \"completed_tasks\": [\"hash1\", \"hash2\"],
   \"state_update\": {{\"key\": \"value\"}}
 }}
 ---END_COLLAB_OUTPUT---
 ```
 
-IMPORTANT: Do NOT run any collab CLI commands (collab add, collab list, collab todo, etc). The harness handles all messaging and task delivery. You have no access to the collab network. Focus on your actual work and report results via the markers above.",
+- \"response\": message back to whoever messaged you
+- \"delegate\": assign new tasks to teammates
+- \"completed_tasks\": list task hashes you finished (from your pending tasks above). The harness will mark them done and auto-route your output to downstream workers.
+- \"state_update\": persist any state for your next invocation
+
+Do NOT run any collab CLI commands. The harness handles all messaging and task delivery. Focus on your actual work.",
             self.instance_id,
             self.get_role(),
+            teammates_str,
             state_str,
             todos_str,
             messages.len(),
@@ -340,6 +381,30 @@ IMPORTANT: Do NOT run any collab CLI commands (collab add, collab list, collab t
                 let to = task.to.trim_start_matches('@');
                 if let Err(e) = self.client.todo_add(to, &task.task).await {
                     self.log_error(&format!("Failed to add todo for @{}: {}", to, e));
+                }
+            }
+
+            // Mark completed tasks and auto-route to downstream workers
+            for hash in &collab_output.completed_tasks {
+                let hash_clean = hash.trim();
+                if hash_clean.is_empty() { continue; }
+                match self.client.todo_done(hash_clean).await {
+                    Ok(_) => self.log(&format!("task {} marked done", hash_clean)),
+                    Err(e) => self.log_error(&format!("Failed to mark task {} done: {}", hash_clean, e)),
+                }
+            }
+
+            // Pipeline: auto-dispatch to downstream workers
+            if !collab_output.completed_tasks.is_empty() && !self.hands_off_to.is_empty() {
+                let summary = collab_output.response.as_deref().unwrap_or("Task completed.");
+                let handoff_msg = format!("Completed work from @{}: {}", self.instance_id, summary);
+                for downstream in &self.hands_off_to {
+                    let to = downstream.trim_start_matches('@');
+                    if let Err(e) = self.client.add_message(to, &handoff_msg, None).await {
+                        self.log_error(&format!("Failed to route to @{}: {}", to, e));
+                    } else {
+                        self.log(&format!("pipeline → @{}", to));
+                    }
                 }
             }
 

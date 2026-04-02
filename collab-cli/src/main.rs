@@ -121,13 +121,14 @@ fn load_dotenv() {
 #[derive(Parser)]
 #[command(name = "collab", version)]
 #[command(about = "Collaboration tool for Claude Code instances", long_about = None)]
+#[command(args_conflicts_with_subcommands = false)]
 struct Cli {
     /// Server URL (overrides $COLLAB_SERVER and ~/.collab.toml)
-    #[arg(long)]
+    #[arg(long, global = true)]
     server: Option<String>,
 
     /// Instance identifier (overrides $COLLAB_INSTANCE and ~/.collab.toml)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     instance: Option<String>,
 
     #[command(subcommand)]
@@ -382,6 +383,26 @@ async fn main() -> Result<()> {
             )
         })?;
 
+        // Load manifest for pipeline config and teammate info
+        let (hands_off_to, teammates) = match find_manifest() {
+            Ok(manifest_path) => {
+                match lifecycle::read_manifest(&manifest_path) {
+                    Ok(manifest) => {
+                        let hands_off = manifest.iter()
+                            .find(|w| w.name == instance_id)
+                            .map(|w| w.hands_off_to.clone())
+                            .unwrap_or_default();
+                        let team: Vec<(String, String)> = manifest.iter()
+                            .map(|w| (w.name.clone(), w.role.clone()))
+                            .collect();
+                        (hands_off, team)
+                    }
+                    Err(_) => (vec![], vec![]),
+                }
+            }
+            Err(_) => (vec![], vec![]),
+        };
+
         let harness = worker::WorkerHarness::new(
             CollabClient::new(&server, &instance_id, token.as_deref()),
             instance_id,
@@ -389,6 +410,8 @@ async fn main() -> Result<()> {
             model,
             auto_reply,
             batch_wait,
+            hands_off_to,
+            teammates,
         );
         harness.run().await?;
         return Ok(());

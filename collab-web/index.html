@@ -1408,6 +1408,7 @@ function startPolling() {
   S.timers.push(setInterval(pollRoster, 30000));   // roster only, every 30s
   S.timers.push(setInterval(heartbeat, 30000));
   S.timers.push(setInterval(pollTodos, 30000));    // todos, every 30s
+  S.timers.push(setInterval(pollAll, 10000));      // fallback: poll messages every 10s in case SSE drops
 }
 
 // ── Avatar picker ─────────────────────────────────────────────────────────────

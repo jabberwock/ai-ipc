@@ -38,6 +38,9 @@ pub struct WorkerConfig {
     pub color: Option<u8>,
     /// Claude model for this worker (e.g., haiku, sonnet) — overrides project default if set
     pub model: Option<String>,
+    /// Pipeline: workers to auto-dispatch to when this worker completes a task
+    #[serde(default)]
+    pub hands_off_to: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -309,15 +312,7 @@ Follow these without exception:
     )
 }
 
-/// Manifest entry for a single worker (used by lifecycle commands)
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerManifestEntry {
-    pub name: String,
-    pub role: String,
-    pub codebase_path: String,
-    pub model: String,
-    pub output_dir: String,
-}
+use crate::lifecycle::WorkerManifestEntry;
 
 /// Write .collab/workers.json manifest for lifecycle management
 fn write_worker_manifest(project_root: &Path, output_dir: &Path, config: &ProjectConfig) -> Result<()> {
@@ -349,6 +344,7 @@ fn write_worker_manifest(project_root: &Path, output_dir: &Path, config: &Projec
                     .unwrap_or(rel)
                     .to_string_lossy().to_string()
             },
+            hands_off_to: worker.hands_off_to.clone(),
         });
     }
 

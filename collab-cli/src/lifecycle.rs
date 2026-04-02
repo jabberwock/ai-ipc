@@ -23,6 +23,9 @@ pub struct WorkerManifestEntry {
     pub codebase_path: String,
     pub model: String,
     pub output_dir: String,
+    /// Pipeline: workers to auto-dispatch to when this worker completes a task
+    #[serde(default)]
+    pub hands_off_to: Vec<String>,
 }
 
 /// SECURITY: Validate workdir path to prevent directory traversal
