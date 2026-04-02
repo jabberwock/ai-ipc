@@ -320,16 +320,18 @@ Requires a terminal with OSC 8 support (iTerm2, Ghostty, WezTerm, Windows Termin
 
 **How it works:**
 1. Opens a persistent SSE connection to the server
-2. When a message arrives, queues it (batches rapid bursts within a configurable window)
-3. Spawns `claude -p` with the message(s), project context, and worker state
-4. Parses Claude's structured output — sends responses, delegates tasks, updates state
-5. Returns to listening. No tokens burned between messages.
+2. On startup, auto-kicks itself — checks todos and begins working immediately
+3. When a message arrives, queues it (batches rapid bursts within a configurable window)
+4. Spawns `claude -p` with: messages, pending todos, teammates/roles, worker state
+5. Parses Claude's structured `---COLLAB_OUTPUT---` JSON — sends responses, delegates tasks, marks todos done, routes to pipeline
+6. If worker sets `"continue": true`, the harness re-invokes immediately — workers loop autonomously until blocked or done
+7. Returns to listening. No tokens burned between messages.
 
 **State persists across invocations** via `.worker-state.json` in the worker directory. Each Claude invocation sees what the previous one left behind — current task, pending work, files touched.
 
-**Trivial messages get auto-replied** without spawning Claude at all. "Got it", "thanks", "ok" — the harness handles these for zero API cost.
-
 **Large messages get offloaded** to temp files instead of bloating the prompt. Messages over 2KB are written to `/tmp/collab-msg-{hash}.md` and referenced by path.
+
+**Workers can't access the collab network.** `COLLAB_*` env vars are stripped from the Claude subprocess. All messaging goes through the `---COLLAB_OUTPUT---` harness — no rogue `collab add` calls burning tokens.
 
 ```bash
 # Run a worker directly
@@ -339,6 +341,79 @@ collab worker --workdir /path/to/project --model haiku
 collab start all
 collab stop all
 collab restart @frontend
+```
+
+### Worker output format
+
+Workers output JSON between `---COLLAB_OUTPUT---` markers:
+
+```json
+---COLLAB_OUTPUT---
+{
+  "response": "message back to the sender",
+  "delegate": [{"to": "@worker", "task": "description"}],
+  "completed_tasks": ["hash1", "hash2"],
+  "continue": true,
+  "state_update": {"current_task": "building tooltips"}
+}
+---END_COLLAB_OUTPUT---
+```
+
+| Field | Description |
+|-------|-------------|
+| `response` | Reply to whoever messaged this worker |
+| `delegate` | Assign tasks to other workers (creates todos) |
+| `completed_tasks` | Mark todo hashes as done — triggers pipeline routing |
+| `continue` | `true` = harness re-invokes immediately. Worker keeps working autonomously. |
+| `state_update` | Persisted to `.worker-state.json` for next invocation |
+
+If Claude doesn't use markers, the entire output is sent as a raw response (fallback).
+
+### Pipeline routing
+
+Define `hands_off_to` in `workers.yaml` to create automatic handoff chains:
+
+```yaml
+workers:
+  - name: researcher
+    role: "Data researcher"
+    hands_off_to: [validator]
+
+  - name: validator
+    role: "Data accuracy auditor"
+    hands_off_to: [database]
+
+  - name: database
+    role: "Database architect"
+    hands_off_to: [builder]
+
+  - name: builder
+    role: "Frontend developer"
+    hands_off_to: [ux-expert]
+
+  - name: ux-expert
+    role: "UX/accessibility testing"
+    hands_off_to: [redteamer]
+
+  - name: redteamer
+    role: "Security review"
+
+  - name: project-manager
+    role: "Coordinate the team, handle exceptions"
+```
+
+When a worker marks a task complete (`completed_tasks`), the harness automatically sends the worker's response to all downstream workers in `hands_off_to`. No project manager bottleneck for routine handoffs.
+
+```
+researcher → validator → database → builder → ux-expert → redteamer
+```
+
+After editing `workers.yaml`, re-initialize and restart:
+
+```bash
+collab init workers.yaml
+collab stop all
+collab start all
 ```
 
 ---
