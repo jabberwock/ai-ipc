@@ -33,12 +33,15 @@ Create `workers.yaml` in your project:
 
 ```yaml
 server: http://localhost:8000
+cli_template: "claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit"
 workers:
   - name: frontend
     role: "Frontend development"
   - name: backend
     role: "Backend API development"
 ```
+
+The `cli_template` tells workers which AI CLI to invoke. Replace `claude` with your tool of choice (e.g., `cursor -p {prompt} --model {model}`, `ollama run {model} {prompt}`). Placeholders: `{prompt}`, `{model}`, `{workdir}`. If omitted, `collab init` writes a `{agent}` placeholder that must be edited before workers can start.
 
 ```bash
 collab init workers.yaml
@@ -237,7 +240,7 @@ The `@` prefix is optional — `@agent` and `agent` are the same. Flags like `--
 2. Heartbeats presence every 30s (visible on roster with current status)
 3. On startup, auto-kicks itself — checks todos and begins working immediately
 4. When a message arrives, queues it (batches rapid bursts within a configurable window)
-5. Spawns `claude -p` with: messages, pending todos, teammates/roles, worker state
+5. Spawns the CLI defined by `cli_template` with: messages, pending todos, teammates/roles, worker state
 6. Parses the JSON response — sends replies, delivers direct messages, delegates tasks, marks todos done, routes to pipeline
 7. If worker sets `"continue": true`, the harness re-invokes immediately (capped at 10 consecutive self-kicks to prevent runaway loops)
 8. If worker stops but has pending todos, the harness auto-nudges them to keep working
@@ -293,6 +296,7 @@ If JSON parsing fails, the entire output is sent as a raw text response (fallbac
 Define `hands_off_to` in `workers.yaml` to create automatic handoff chains:
 
 ```yaml
+cli_template: "claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit"
 workers:
   - name: researcher
     role: "Data researcher"
@@ -305,6 +309,7 @@ workers:
   - name: builder
     role: "Frontend developer"
     hands_off_to: [project-manager]
+    cli_template: "cursor -p {prompt} --model {model}"  # per-worker override
 
   - name: project-manager
     role: "Coordinate the team, handle exceptions"
