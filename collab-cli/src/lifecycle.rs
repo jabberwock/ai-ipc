@@ -52,30 +52,6 @@ fn validate_workdir(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// SECURITY: Whitelist allowed env vars for worker process
-fn build_worker_env(
-    instance_name: &str,
-    server: &str,
-    token: Option<&str>,
-) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-
-    env.insert("COLLAB_INSTANCE".to_string(), instance_name.to_string());
-    env.insert("COLLAB_SERVER".to_string(), server.to_string());
-    if let Some(token) = token {
-        env.insert("COLLAB_TOKEN".to_string(), token.to_string());
-    }
-
-    // Inherit PATH and HOME for shell execution (required for `collab` to find itself)
-    if let Ok(path) = std::env::var("PATH") {
-        env.insert("PATH".to_string(), path);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        env.insert("HOME".to_string(), home);
-    }
-
-    env
-}
 
 /// SECURITY: Spawn worker with validated args, safe env vars only
 pub fn spawn_worker(
@@ -105,11 +81,11 @@ pub fn spawn_worker(
         .arg("--workdir").arg(&validated_workdir)
         .arg("--model").arg(model);
 
-    // Set ONLY whitelisted env vars
-    cmd.env_clear();
-    let worker_env = build_worker_env(instance_name, server, token);
-    for (key, val) in worker_env.iter() {
-        cmd.env(key, val);
+    // Inherit parent env, override COLLAB_* for this worker's identity
+    cmd.env("COLLAB_INSTANCE", instance_name);
+    cmd.env("COLLAB_SERVER", server);
+    if let Some(token) = token {
+        cmd.env("COLLAB_TOKEN", token);
     }
 
     // Spawn in background

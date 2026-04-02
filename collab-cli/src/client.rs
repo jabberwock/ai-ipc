@@ -781,6 +781,15 @@ impl CollabClient {
         Ok(())
     }
 
+    pub async fn fetch_todos(&self, instance: &str) -> Result<Vec<Todo>> {
+        let url = format!("{}/todos/{}", self.base_url, instance);
+        let resp = self.auth(self.client.get(&url)).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("Server error: {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
     pub async fn todo_list(&self, instance: Option<&str>) -> Result<()> {
         let target = instance.unwrap_or(&self.instance_id);
         let url = format!("{}/todos/{}", self.base_url, target);

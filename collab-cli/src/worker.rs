@@ -211,6 +211,22 @@ impl WorkerHarness {
         // Load previous state
         let state = self.load_state();
 
+        // Fetch pending todos for this worker
+        let todos_str = match self.client.fetch_todos(&self.instance_id).await {
+            Ok(todos) if !todos.is_empty() => {
+                let mut lines = String::from("Pending tasks assigned to you:\n");
+                for todo in &todos {
+                    lines.push_str(&format!("  - [{}] (from @{}): {}\n",
+                        &todo.hash[..7.min(todo.hash.len())],
+                        todo.assigned_by,
+                        todo.description
+                    ));
+                }
+                lines
+            }
+            _ => "No pending tasks.".to_string(),
+        };
+
         // Build prompt
         let mut msg_lines = String::new();
         for msg in messages {
@@ -233,27 +249,48 @@ impl WorkerHarness {
 Previous state:
 {}
 
+{}
+
 Messages ({}):
 {}
 
-Instructions: Read CLAUDE.md only if you need to remember your rules. Act on the messages above. When done, output a JSON block between ---COLLAB_OUTPUT--- and ---END_COLLAB_OUTPUT--- markers with fields: response (string or null), delegate (array of {{to: string, task: string}}, optional), state_update (object, optional). Do NOT run collab CLI commands — the harness handles delivery.",
+Instructions: Act on the messages above. Use Bash/Read/Write/Edit to do your actual work (coding, research, testing). When done, output a JSON block between ---COLLAB_OUTPUT--- and ---END_COLLAB_OUTPUT--- markers:
+
+```
+---COLLAB_OUTPUT---
+{{
+  \"response\": \"your reply to the sender (string or null)\",
+  \"delegate\": [{{\"to\": \"@worker\", \"task\": \"description\"}}],
+  \"state_update\": {{\"key\": \"value\"}}
+}}
+---END_COLLAB_OUTPUT---
+```
+
+IMPORTANT: Do NOT run any collab CLI commands (collab add, collab list, collab todo, etc). The harness handles all messaging and task delivery. You have no access to the collab network. Focus on your actual work and report results via the markers above.",
             self.instance_id,
             self.get_role(),
             state_str,
+            todos_str,
             messages.len(),
             msg_lines
         );
 
-        // Spawn claude
-        let output = match Command::new("claude")
-            .arg("-p")
+        // Spawn claude — strip COLLAB_* env vars so it can't shell out to collab CLI
+        let mut cmd = Command::new("claude");
+        cmd.arg("-p")
             .arg(&prompt)
             .arg("--model")
             .arg(&self.model)
             .arg("--allowedTools")
             .arg("Bash,Read,Write,Edit")
-            .current_dir(&self.workdir)
-            .output()
+            .current_dir(&self.workdir);
+
+        // Remove collab env vars from subprocess — harness handles all communication
+        cmd.env_remove("COLLAB_INSTANCE");
+        cmd.env_remove("COLLAB_SERVER");
+        cmd.env_remove("COLLAB_TOKEN");
+
+        let output = match cmd.output()
         {
             Ok(out) => out,
             Err(e) => {
@@ -262,10 +299,24 @@ Instructions: Read CLAUDE.md only if you need to remember your rules. Act on the
             }
         };
 
+        // Debug: always dump claude output on failure
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            self.log_error(&format!("Claude exited with status {}: {}", output.status, stderr));
-            return Err(anyhow::anyhow!("Claude failed: {}", stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let debug_path = format!("/tmp/collab-debug-{}.txt", self.instance_id);
+            let _ = std::fs::write(&debug_path, format!(
+                "EXIT: {}\nSTDOUT ({} bytes):\n{}\nSTDERR ({} bytes):\n{}\nPROMPT:\n{}",
+                output.status, stdout.len(), stdout, stderr.len(), stderr, prompt
+            ));
+            let detail = if stderr.trim().is_empty() && stdout.trim().is_empty() {
+                format!("(empty output — see {})", debug_path)
+            } else if stderr.trim().is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            };
+            self.log_error(&format!("Claude exited with status {}: {}", output.status, detail));
+            return Err(anyhow::anyhow!("Claude failed: {}", detail));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -295,7 +346,16 @@ Instructions: Read CLAUDE.md only if you need to remember your rules. Act on the
             // Update state
             self.save_state(&collab_output.state_update);
         } else {
-            self.log_error(&format!("No output markers found in claude response (looked for ---COLLAB_OUTPUT--- markers)"));
+            // Fallback: no markers found — treat entire stdout as the response
+            let raw = stdout.trim().to_string();
+            if !raw.is_empty() {
+                self.log(&format!("no markers — sending raw response"));
+                for msg in messages {
+                    if let Err(e) = self.client.add_message(&msg.sender, &raw, None).await {
+                        self.log_error(&format!("Failed to send response to @{}: {}", msg.sender, e));
+                    }
+                }
+            }
         }
 
         let response_count = messages.len();

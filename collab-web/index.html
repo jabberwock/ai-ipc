@@ -234,7 +234,7 @@
     .img-strip-remove:hover { color: var(--danger); background: rgba(239,68,68,.15); }
     .msg-img { max-width: 320px; max-height: 240px; border-radius: 6px; display: block; margin-top: 4px; cursor: zoom-in; }
     .compose-field:focus-within { border-color: var(--bhi); }
-    #compose-input { flex: 1; background: none; border: none; outline: none; font-size: 15px; color: var(--text); }
+    #compose-input { flex: 1; background: none; border: none; outline: none; font-size: 15px; color: var(--text); resize: none; overflow: hidden; line-height: 1.4; font-family: inherit; padding: 0; min-height: 21px; max-height: 120px; }
     #compose-input::placeholder { color: var(--dim); }
     .compose-send {
       width: 26px; height: 26px; border-radius: 5px; flex-shrink: 0;
@@ -487,7 +487,7 @@
           <img id="img-preview-thumb" alt="pasted image preview">
           <button id="img-remove-btn" class="img-strip-remove" type="button" aria-label="Remove pasted image">×</button>
         </div>
-        <input id="compose-input" placeholder="Message everyone  ·  @worker to DM" autocomplete="off" spellcheck="false" aria-label="Message" aria-autocomplete="list" aria-controls="mention-list">
+        <textarea id="compose-input" placeholder="Message everyone  ·  @worker to DM" autocomplete="off" spellcheck="false" aria-label="Message" aria-autocomplete="list" aria-controls="mention-list" rows="1"></textarea>
         <button class="compose-send" id="compose-send" aria-label="Send message">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
@@ -1666,6 +1666,9 @@ function applyMention(id) {
 
 document.getElementById('compose-input').addEventListener('input', () => {
   const input = document.getElementById('compose-input');
+  // Auto-resize textarea
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
   const val   = input.value;
 
   // Slash command palette — show when typing /cmd with no space yet
@@ -1741,6 +1744,7 @@ async function handleSend() {
 
   localStorage.setItem('collab-from', from);
   inputEl.value = '';
+  inputEl.style.height = 'auto';
   const savedImage = pendingImage;
   pendingImage = null;
   document.getElementById('img-strip').hidden = true;
