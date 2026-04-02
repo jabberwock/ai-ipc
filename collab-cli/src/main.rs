@@ -19,8 +19,6 @@ struct Config {
     host: Option<String>,
     instance: Option<String>,
     token: Option<String>,
-    #[serde(default)]
-    recipients: Vec<String>,
 }
 
 fn load_config() -> Config {
@@ -32,7 +30,6 @@ fn load_config() -> Config {
             host: l.host.or(g.host),
             instance: l.instance.or(g.instance),
             token: l.token.or(g.token),
-            recipients: if l.recipients.is_empty() { g.recipients } else { l.recipients },
         },
         (Some(c), None) | (None, Some(c)) => c,
         (None, None) => Config::default(),
@@ -218,20 +215,6 @@ enum Commands {
         refs: Option<String>,
     },
 
-    /// [DEPRECATED] Poll for new messages — use `collab stream` instead
-    ///
-    /// collab stream delivers messages instantly via SSE with zero polling and
-    /// survives backgrounding. collab watch is kept for compatibility only.
-    Watch {
-        /// Polling interval in seconds (default: 10)
-        #[arg(short, long, default_value = "10")]
-        interval: u64,
-
-        /// Describe what you're working on (shown in roster)
-        #[arg(short, long, value_name = "DESCRIPTION")]
-        role: Option<String>,
-    },
-
     /// Send a message to all currently active workers (everyone in the roster except you)
     Broadcast {
         /// Message content
@@ -243,15 +226,12 @@ enum Commands {
         refs: Option<String>,
     },
 
-    /// Stream messages in real-time via SSE (zero-poll alternative to watch)
+    /// Stream messages in real-time via SSE (zero-poll, instant delivery)
     Stream {
         /// Describe what you're working on (shown in roster)
         #[arg(short, long, value_name = "DESCRIPTION")]
         role: Option<String>,
     },
-
-    /// Signal all running `collab watch` instances to exit gracefully
-    StopAll,
 
     /// View message history including sent and received messages
     History {
@@ -365,8 +345,6 @@ async fn main() -> Result<()> {
 
     let token = std::env::var("COLLAB_TOKEN").ok().or(file_config.token.clone());
 
-    let recipients = file_config.recipients;
-
     if let Commands::Init { file, output } = cli.command {
         match file {
             Some(path) => {
@@ -421,7 +399,7 @@ async fn main() -> Result<()> {
     }
 
     if let Commands::Stop { target } = cli.command {
-        return lifecycle_stop(&target).await;
+        return lifecycle_stop(&target, &server, token.as_deref()).await;
     }
 
     if let Commands::Restart { target } = cli.command {
@@ -455,8 +433,7 @@ async fn main() -> Result<()> {
              \n\
              Example ~/.collab.toml:\n\
              host = \"http://localhost:8000\"\n\
-             instance = \"worker1\"\n\
-             recipients = [\"worker2\", \"worker3\"]"
+             instance = \"worker1\""
         )
     })?;
 
@@ -486,9 +463,6 @@ async fn main() -> Result<()> {
             });
             client.add_message(recipient, &message, ref_hashes).await?;
         }
-        Commands::Watch { interval, role } => {
-            client.watch_messages(interval, role, recipients).await?;
-        }
         Commands::Stream { role } => {
             client.stream_messages(role).await?;
         }
@@ -497,9 +471,6 @@ async fn main() -> Result<()> {
                 r.split(',').map(|s| s.trim().to_string()).collect()
             });
             client.broadcast(&message, ref_hashes).await?;
-        }
-        Commands::StopAll => {
-            client.stop_all().await?;
         }
         Commands::History { filter } => {
             let filter_id = filter.as_deref().map(|s| s.trim_start_matches('@'));
@@ -604,7 +575,7 @@ async fn lifecycle_start(target: &str, server: &str, token: Option<&str>) -> Res
     Ok(())
 }
 
-async fn lifecycle_stop(target: &str) -> Result<()> {
+async fn lifecycle_stop(target: &str, server: &str, token: Option<&str>) -> Result<()> {
     let targets = parse_target(target)?;
     let manifest_path = find_manifest()?;
     let _manifest = lifecycle::read_manifest(&manifest_path)?;
@@ -635,6 +606,15 @@ async fn lifecycle_stop(target: &str) -> Result<()> {
         return Ok(());
     }
 
+    // When stopping all, also broadcast the stop signal so any collab stream
+    // instances (not managed by lifecycle) also exit gracefully.
+    if targets[0] == "all" {
+        let client = CollabClient::new(server, "lifecycle", token);
+        if let Err(e) = client.stop_all().await {
+            eprintln!("Warning: could not broadcast stop signal: {}", e);
+        }
+    }
+
     for name in &workers_to_stop {
         if let Some(worker_state) = state.remove(name) {
             lifecycle::kill_process(worker_state.pid, name)?;
@@ -647,7 +627,7 @@ async fn lifecycle_stop(target: &str) -> Result<()> {
 }
 
 async fn lifecycle_restart(target: &str, server: &str, token: Option<&str>) -> Result<()> {
-    lifecycle_stop(target).await?;
+    lifecycle_stop(target, server, token).await?;
     std::thread::sleep(std::time::Duration::from_millis(500));
     lifecycle_start(target, server, token).await?;
     Ok(())

@@ -247,7 +247,7 @@ collab add @worker2 "Applied your suggestions" \
 
 #### `collab stream`
 
-Stream incoming messages in real-time via Server-Sent Events (SSE). Zero-polling alternative to `watch` that survives backgrounding.
+Stream incoming messages in real-time via Server-Sent Events (SSE). Zero-polling, instant delivery.
 
 ```bash
 # Stream messages and set your role
@@ -265,15 +265,6 @@ Time: 2024-03-27 14:35:12 UTC
 
 Fixed the auth redirect issue
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-#### `collab watch` (deprecated)
-
-Continuously poll for new messages every 10 seconds. Use `collab stream` instead for real-time, zero-poll delivery.
-
-```bash
-# Watch with custom interval (e.g., every 5 seconds)
-collab watch --interval 5
 ```
 
 ## Configuration
@@ -404,7 +395,7 @@ collab add @frontend "API endpoints ready for integration"
 ## Message Retention
 
 - Messages are retained for **1 hour** from creation time
-- After 1 hour, messages are filtered out from `list` and `watch` results
+- After 1 hour, messages are filtered out from `list` and `stream` results
 - Use the server's `/messages/cleanup` endpoint to manually purge old messages
 
 ```bash
@@ -463,9 +454,9 @@ export COLLAB_INSTANCE=api-worker
 export COLLAB_INSTANCE=database-worker
 ```
 
-### 2. Use `watch` for Active Collaboration
+### 2. Use `stream` for Active Collaboration
 
-During intensive collaboration sessions, run `collab watch` in a dedicated terminal to get real-time notifications.
+During intensive collaboration sessions, run `collab stream` in a dedicated terminal to get real-time notifications.
 
 ### 3. Reference Previous Messages
 

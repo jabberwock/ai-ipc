@@ -509,9 +509,9 @@ impl CollabClient {
         Ok(())
     }
 
-    /// Broadcast the stop-watch signal and clear all roster presence entries.
+    /// Broadcast the stop signal and clear all roster presence entries.
     pub async fn stop_all(&self) -> Result<()> {
-        // 1. Broadcast the stop-watch signal so watch loops exit.
+        // 1. Broadcast the stop signal so stream instances exit.
         let msg = self.send_message_raw("all", STOP_WATCH_SIGNAL, vec![]).await?;
         println!("⛔ Stop signal broadcast to @all  [{}]", link_hash(&msg.hash[..7]));
 
@@ -527,7 +527,7 @@ impl CollabClient {
             Err(e) => eprintln!("  Warning: could not clear roster: {}", e),
         }
 
-        println!("  Running `collab watch` instances will exit on next poll.");
+        println!("  Running `collab stream` instances will exit.");
         Ok(())
     }
 
@@ -538,130 +538,6 @@ impl CollabClient {
         println!("  Time: {}", msg.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
         println!("  (visible to all workers on their next `collab list`)");
         Ok(())
-    }
-
-    pub async fn watch_messages(
-        &self,
-        interval_secs: u64,
-        role: Option<String>,
-        recipients: Vec<String>,
-    ) -> Result<()> {
-        use tokio::time::{sleep, Duration};
-
-        let mut seen_ids: HashSet<String> = HashSet::new();
-        // Track which recipients we've already warned about
-        let mut warned_missing: HashSet<String> = HashSet::new();
-        // Track which recipients have been seen at least once
-        let mut seen_recipients: HashSet<String> = HashSet::new();
-
-        // Persist role across context resets: use provided role, fall back to saved role
-        let mut state = load_read_state();
-        let effective_role = role.clone().or_else(|| {
-            state.roles.get(&self.instance_id).cloned()
-        });
-        if let Some(ref r) = role {
-            state.roles.insert(self.instance_id.clone(), r.clone());
-            save_read_state(&state);
-        }
-        let role_str = effective_role.as_deref();
-
-        eprintln!("⚠  collab watch is deprecated — use `collab stream` instead.");
-        eprintln!("   collab stream delivers messages instantly via SSE with zero polling.");
-        eprintln!();
-        println!("Watching for messages to @{} (polling every {}s)", self.instance_id, interval_secs);
-        if !recipients.is_empty() {
-            println!("Waiting for: {}", recipients.iter().map(|r| format!("@{}", r)).collect::<Vec<_>>().join(", "));
-        }
-        println!("Press Ctrl+C to stop\n");
-
-        loop {
-            // Heartbeat presence
-            if let Err(e) = self.heartbeat(role_str).await {
-                eprintln!("Warning: presence heartbeat failed: {}", e);
-            }
-
-            // Check roster for configured recipients
-            if !recipients.is_empty() {
-                if let Ok(roster) = self.fetch_roster().await {
-                    let online: HashSet<String> = roster.iter().map(|w| w.instance_id.clone()).collect();
-
-                    for recipient in &recipients {
-                        let r = recipient.trim_start_matches('@').to_string();
-                        if online.contains(&r) {
-                            if !seen_recipients.contains(&r) {
-                                seen_recipients.insert(r.clone());
-                                warned_missing.remove(&r);
-                                println!("── @{} is online ──", r);
-                            }
-                        } else if !warned_missing.contains(&r) {
-                            warned_missing.insert(r.clone());
-                            // Only warn after they were previously seen (went offline)
-                            if seen_recipients.contains(&r) {
-                                println!("── @{} went offline ──", r);
-                            }
-                        }
-                    }
-
-                    // On first poll, report any recipients not yet online
-                    if seen_ids.is_empty() {
-                        let missing: Vec<_> = recipients.iter()
-                            .filter(|r| {
-                                let r = r.trim_start_matches('@');
-                                !online.contains(r)
-                            })
-                            .map(|r| format!("@{}", r.trim_start_matches('@')))
-                            .collect();
-                        if !missing.is_empty() {
-                            println!("Not yet online: {}", missing.join(", "));
-                        }
-                    }
-                }
-            }
-
-            // Poll for new messages
-            let url = format!("{}/messages/{}", self.base_url, self.instance_id);
-            match self.auth(self.client.get(&url)).send().await {
-                Ok(response) if response.status().is_success() => {
-                    match response.json::<Vec<Message>>().await {
-                        Ok(messages) => {
-                            let new_messages: Vec<_> = messages
-                                .into_iter()
-                                .filter(|msg| !seen_ids.contains(&msg.id))
-                                .collect();
-
-                            for msg in &new_messages {
-                                seen_ids.insert(msg.id.clone());
-
-                                // Stop-watch signal: clear own presence and exit gracefully.
-                                if msg.content.trim() == STOP_WATCH_SIGNAL {
-                                    println!("⛔ Stop signal received from @{} — clearing presence and exiting.", msg.sender);
-                                    let _ = self.delete_presence().await;
-                                    return Ok(());
-                                }
-
-                                let tag = if msg.recipient == "all" { " [broadcast]" } else { "" };
-                                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                                println!("← @{}{}  {}", msg.sender, tag, msg.timestamp.format("%H:%M:%S UTC"));
-                                println!("Hash: {}", link_hash(&msg.hash[..7]));
-                                if !msg.refs.is_empty() {
-                                    let short_refs: Vec<String> = msg.refs.iter()
-                                        .map(|r| link_hash(&r.chars().take(7).collect::<String>()))
-                                        .collect();
-                                    println!("Refs: {}", short_refs.join(", "));
-                                }
-                                println!("\n{}\n", msg.content);
-                                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-                            }
-                        }
-                        Err(e) => eprintln!("Warning: failed to parse messages: {}", e),
-                    }
-                }
-                Ok(response) => eprintln!("Warning: server error: {}", response.status()),
-                Err(e) => eprintln!("Warning: connection error: {}", e),
-            }
-
-            sleep(Duration::from_secs(interval_secs)).await;
-        }
     }
 
     pub async fn stream_messages(&self, role: Option<String>) -> Result<()> {

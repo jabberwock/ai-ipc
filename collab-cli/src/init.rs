@@ -77,8 +77,10 @@ pub fn generate(config: &ProjectConfig, output_dir_override: Option<&str>) -> Re
         println!("  ✓  {}", path.display());
     }
 
-    // Write worker manifest to .collab/workers.json
-    write_worker_manifest(base, config)?;
+    // Write worker manifest to .collab/workers.json in the PROJECT ROOT, not output_dir
+    // This allows 'collab start all' to find it regardless of output_dir location
+    let project_root = Path::new(".");
+    write_worker_manifest(project_root, base, config)?;
 
     // Write dashboard-config.json for avatar/color presets
     let mut entries = Vec::new();
@@ -318,8 +320,8 @@ pub struct WorkerManifestEntry {
 }
 
 /// Write .collab/workers.json manifest for lifecycle management
-fn write_worker_manifest(base: &Path, config: &ProjectConfig) -> Result<()> {
-    let collab_dir = base.join(".collab");
+fn write_worker_manifest(project_root: &Path, output_dir: &Path, config: &ProjectConfig) -> Result<()> {
+    let collab_dir = project_root.join(".collab");
     fs::create_dir_all(&collab_dir)?;
 
     let mut manifest_entries = Vec::new();
@@ -334,7 +336,7 @@ fn write_worker_manifest(base: &Path, config: &ProjectConfig) -> Result<()> {
             role: worker.role.clone(),
             codebase_path,
             model: worker_model,
-            output_dir: base.join(&worker.name).to_string_lossy().to_string(),
+            output_dir: output_dir.join(&worker.name).to_string_lossy().to_string(),
         });
     }
 
