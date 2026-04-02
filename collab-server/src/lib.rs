@@ -212,7 +212,7 @@ async fn list_messages(
         .fetch_all(&state.db)
         .await
     } else {
-        let cutoff_iso = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        let cutoff_iso = (Utc::now() - Duration::hours(8)).to_rfc3339();
         sqlx::query(
             r#"
             SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
@@ -269,7 +269,7 @@ async fn get_history(
         .fetch_all(&state.db)
         .await
     } else {
-        let cutoff_iso = (Utc::now() - Duration::hours(1)).to_rfc3339();
+        let cutoff_iso = (Utc::now() - Duration::hours(8)).to_rfc3339();
         sqlx::query(
             r#"
             SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
@@ -296,7 +296,7 @@ async fn get_history(
 async fn get_roster(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<WorkerInfo>>, StatusCode> {
-    let one_hour_ago = Utc::now() - Duration::hours(1);
+    let one_hour_ago = Utc::now() - Duration::hours(8);
     let cutoff_iso = one_hour_ago.to_rfc3339();
 
     let presence_rows = sqlx::query(
@@ -586,7 +586,7 @@ async fn stream_all_events(
 async fn get_metrics(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let cutoff_iso = (Utc::now() - Duration::hours(1)).to_rfc3339();
+    let cutoff_iso = (Utc::now() - Duration::hours(8)).to_rfc3339();
 
     let messages_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
         .fetch_one(&state.db)
@@ -635,7 +635,7 @@ async fn cleanup_old_messages(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let one_hour_ago = Utc::now() - Duration::hours(1);
+    let one_hour_ago = Utc::now() - Duration::hours(8);
     let cutoff_iso = one_hour_ago.to_rfc3339();
 
     let result = sqlx::query("DELETE FROM messages WHERE timestamp < ?")

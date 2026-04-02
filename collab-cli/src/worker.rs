@@ -45,6 +45,9 @@ struct CollabOutput {
     /// Task hashes marked as completed this invocation
     #[serde(default)]
     pub completed_tasks: Vec<String>,
+    /// Send messages to specific teammates
+    #[serde(default)]
+    pub messages: Vec<DirectMessage>,
     /// If true, harness re-sends this output back to the worker as a new message,
     /// keeping them working autonomously until they're actually blocked.
     #[serde(default)]
@@ -55,6 +58,12 @@ struct CollabOutput {
 struct DelegateTask {
     pub to: String,
     pub task: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DirectMessage {
+    pub to: String,
+    pub text: String,
 }
 
 pub struct WorkerHarness {
@@ -114,7 +123,11 @@ impl WorkerHarness {
         let teammates = self.teammates.clone();
         let batch_status = current_status.clone();
 
+        let max_self_kicks: u32 = 10;
+
         tokio::spawn(async move {
+            let mut consecutive_kicks: u32 = 0;
+
             loop {
                 sleep(Duration::from_millis(batch_wait_ms)).await;
 
@@ -137,6 +150,20 @@ impl WorkerHarness {
                     };
                     *first_time.lock().await = None;
 
+                    // Check if this is a self-kick (message from self)
+                    let is_self_kick = messages.iter().all(|m| m.sender == instance_id);
+                    if is_self_kick {
+                        consecutive_kicks += 1;
+                        if consecutive_kicks > max_self_kicks {
+                            eprintln!("[{}] self-kick cap reached ({}) — pausing until external message",
+                                Utc::now().format("%H:%M:%S UTC"), max_self_kicks);
+                            consecutive_kicks = 0;
+                            continue;
+                        }
+                    } else {
+                        consecutive_kicks = 0;
+                    }
+
                     // Process messages
                     let harness = WorkerHarness {
                         client: client.clone(),
@@ -157,6 +184,24 @@ impl WorkerHarness {
                     let state = harness.load_state();
                     if let Some(status) = &state.status {
                         *batch_status.lock().await = status.clone();
+                    }
+
+                    // #1: Auto-kick if worker has pending todos but didn't self-kick
+                    if !is_self_kick || consecutive_kicks <= 1 {
+                        if let Ok(todos) = harness.client.fetch_todos(&harness.instance_id).await {
+                            if !todos.is_empty() {
+                                // Check if worker already self-kicked (message in queue)
+                                let q = queue.lock().await;
+                                if q.is_empty() {
+                                    drop(q);
+                                    let _ = harness.client.add_message(
+                                        &harness.instance_id,
+                                        &format!("You still have {} pending tasks. Keep working.", todos.len()),
+                                        None
+                                    ).await;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -331,17 +376,19 @@ When done, your FINAL output must be ONLY a JSON object (no other text before or
 {{
   \"response\": \"your reply to the sender (string or null)\",
   \"delegate\": [{{\"to\": \"@worker\", \"task\": \"description\"}}],
+  \"messages\": [{{\"to\": \"@worker\", \"text\": \"message\"}}],
   \"completed_tasks\": [\"hash1\", \"hash2\"],
   \"continue\": false,
   \"state_update\": {{\"key\": \"value\"}}
 }}
 
 Fields:
-- response: message back to whoever messaged you
-- delegate: assign new tasks to teammates (optional, default [])
-- completed_tasks: task hashes you finished from your pending tasks (optional, default [])
-- continue: true to keep working, false when blocked or done
-- state_update: any state to persist for your next invocation (optional, default {{}}). Include a \"status\" field to update your roster presence (e.g. \"working on tooltip CSS\")
+- response: reply back to whoever messaged you
+- delegate: assign tasks to teammates — creates a todo and pings them (optional)
+- messages: send messages to any teammate directly (optional)
+- completed_tasks: task hashes you finished — marks done and routes to downstream workers (optional)
+- continue: true to keep working autonomously, false when blocked or done
+- state_update: persist state for next invocation. Include \"status\" to update your roster presence
 
 Do NOT run any collab CLI commands. The harness handles all messaging and task delivery. Focus on your actual work.",
             self.instance_id,
@@ -433,6 +480,14 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
                 }
             }
 
+            // Send direct messages to specific teammates
+            for dm in &collab_output.messages {
+                let to = dm.to.trim_start_matches('@');
+                if let Err(e) = self.client.add_message(to, &dm.text, None).await {
+                    self.log_error(&format!("Failed to message @{}: {}", to, e));
+                }
+            }
+
             // Mark completed tasks and auto-route to downstream workers
             for hash in &collab_output.completed_tasks {
                 let hash_clean = hash.trim();
@@ -487,8 +542,25 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             }
         }
 
-        let response_count = messages.len();
-        self.log(&format!("done — claude exited ({}s), delivered {} responses", duration, response_count));
+        // Token usage estimate (~4 chars per token) and log
+        let input_chars = prompt.len();
+        let output_chars = stdout.len();
+        let est_input_tokens = input_chars / 4;
+        let est_output_tokens = output_chars / 4;
+        self.log(&format!("done — {}s, ~{}+{} tokens", duration, est_input_tokens, est_output_tokens));
+
+        // Append to usage log
+        let log_line = format!("{}\t{}\t{}\t{}\t{}\t{}\n",
+            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            self.instance_id,
+            duration,
+            est_input_tokens,
+            est_output_tokens,
+            self.model
+        );
+        let log_path = self.workdir.join("../../.collab/usage.log");
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()));
 
         Ok(())
     }
