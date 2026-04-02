@@ -160,11 +160,7 @@ impl WorkerHarness {
             }
         });
 
-        // Auto-kick: send self a boot message so workers start immediately
-        if let Err(e) = self.client.add_message(&self.instance_id, "Session start. You MUST check your pending tasks and start working on them immediately. Set continue:true in your output to keep working through your task list. Only set continue:false when you are genuinely blocked on someone else or have zero tasks left.", None).await {
-            self.log_error(&format!("Failed to send boot message: {}", e));
-        }
-
+        let mut booted = false;
         let mut backoff_secs = 1u64;
 
         loop {
@@ -179,6 +175,14 @@ impl WorkerHarness {
                 Ok(response) if response.status().is_success() => {
                     backoff_secs = 1;
                     self.log(&format!("idle — listening for @{}", self.instance_id));
+
+                    // Auto-kick: send boot message AFTER SSE is connected (only once)
+                    if !booted {
+                        booted = true;
+                        if let Err(e) = self.client.add_message(&self.instance_id, "Session start. You MUST check your pending tasks and start working on them immediately. Set continue:true in your output to keep working through your task list. Only set continue:false when you are genuinely blocked on someone else or have zero tasks left.", None).await {
+                            self.log_error(&format!("Failed to send boot message: {}", e));
+                        }
+                    }
 
                     let mut buffer = String::new();
                     let mut response = response;
