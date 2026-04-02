@@ -416,15 +416,19 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
                 }
             }
 
-            // Delegate tasks — create todo AND message the worker to wake them up
-            for task in &collab_output.delegate {
-                let to = task.to.trim_start_matches('@');
-                if let Err(e) = self.client.todo_add(to, &task.task).await {
-                    self.log_error(&format!("Failed to add todo for @{}: {}", to, e));
-                } else {
-                    let notify = format!("New task from @{}: {}", self.instance_id, task.task);
-                    if let Err(e) = self.client.add_message(to, &notify, None).await {
-                        self.log_error(&format!("Failed to notify @{}: {}", to, e));
+            // Delegate tasks — create todo AND ping the worker to wake them up
+            if !collab_output.delegate.is_empty() {
+                let mut notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for task in &collab_output.delegate {
+                    let to = task.to.trim_start_matches('@');
+                    if let Err(e) = self.client.todo_add(to, &task.task).await {
+                        self.log_error(&format!("Failed to add todo for @{}: {}", to, e));
+                    } else if notified.insert(to.to_string()) {
+                        // One ping per worker, not per task — the todo list has the details
+                        let notify = format!("New task assigned — check your todo list.");
+                        if let Err(e) = self.client.add_message(to, &notify, None).await {
+                            self.log_error(&format!("Failed to notify @{}: {}", to, e));
+                        }
                     }
                 }
             }
