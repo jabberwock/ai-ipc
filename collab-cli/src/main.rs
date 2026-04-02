@@ -496,19 +496,27 @@ async fn main() -> Result<()> {
             }
         }
 
+        let fmt_time = |secs: u64| -> String {
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            if h > 0 { format!("{:>2}:{:02}:{:02}", h, m, s) }
+            else { format!("   {:02}:{:02}", m, s) }
+        };
+
         println!("Token usage (estimated ~4 chars/token)\n");
-        println!("{:<20} {:>8} {:>8} {:>6} {:>6}", "Worker", "Input", "Output", "Calls", "Time");
-        println!("{}", "─".repeat(52));
+        println!("{:<20} {:>8} {:>8} {:>6} {:>8}", "Worker", "Input", "Output", "Calls", "Time");
+        println!("{}", "─".repeat(55));
 
         let mut workers: Vec<_> = per_worker.iter().collect();
         workers.sort_by(|a, b| (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)));
 
         for (name, (inp, out, dur, calls)) in &workers {
-            println!("{:<20} {:>7}K {:>7}K {:>6} {:>5}s", name, inp / 1000, out / 1000, calls, dur);
+            println!("{:<20} {:>7}K {:>7}K {:>6} {:>8}", name, inp / 1000, out / 1000, calls, fmt_time(*dur));
         }
 
-        println!("{}", "─".repeat(52));
-        println!("{:<20} {:>7}K {:>7}K {:>6} {:>5}s", "TOTAL", total_input / 1000, total_output / 1000, total_calls, total_duration);
+        println!("{}", "─".repeat(55));
+        println!("{:<20} {:>7}K {:>7}K {:>6} {:>8}", "TOTAL", total_input / 1000, total_output / 1000, total_calls, fmt_time(total_duration));
 
         // Rough cost estimate (haiku)
         let input_cost = (total_input as f64 / 1_000_000.0) * 0.25;

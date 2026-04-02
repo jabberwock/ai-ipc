@@ -571,48 +571,7 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
     }
 
     fn parse_collab_output(&self, output: &str) -> Option<CollabOutput> {
-        // Strip markdown code fences if present
-        let cleaned = if output.contains("```") {
-            let mut result = String::new();
-            let mut in_fence = false;
-            for line in output.lines() {
-                if line.trim().starts_with("```") {
-                    in_fence = !in_fence;
-                    if !in_fence { continue; } // closing fence
-                    continue; // opening fence (```json etc)
-                }
-                if in_fence {
-                    result.push_str(line);
-                    result.push('\n');
-                }
-            }
-            if result.trim().is_empty() { output.to_string() } else { result }
-        } else {
-            output.to_string()
-        };
-
-        // Try to find valid CollabOutput JSON — scan from the end backwards
-        let bytes = cleaned.as_bytes();
-        let mut depth = 0i32;
-        let mut end_pos = None;
-
-        for i in (0..bytes.len()).rev() {
-            if bytes[i] == b'}' {
-                if depth == 0 { end_pos = Some(i); }
-                depth += 1;
-            } else if bytes[i] == b'{' {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(end) = end_pos {
-                        let json_str = &cleaned[i..=end];
-                        if let Ok(parsed) = serde_json::from_str::<CollabOutput>(json_str) {
-                            return Some(parsed);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        parse_collab_output(output)
     }
 
     fn load_state(&self) -> WorkerState {
@@ -668,5 +627,168 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
 
         // Also print to stderr
         eprintln!("{}", log_entry);
+    }
+}
+
+fn parse_collab_output(output: &str) -> Option<CollabOutput> {
+    // Strip markdown code fences if present
+    let cleaned = if output.contains("```") {
+        let mut result = String::new();
+        let mut in_fence = false;
+        for line in output.lines() {
+            if line.trim().starts_with("```") {
+                in_fence = !in_fence;
+                if !in_fence { continue; } // closing fence
+                continue; // opening fence (```json etc)
+            }
+            if in_fence {
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+        if result.trim().is_empty() { output.to_string() } else { result }
+    } else {
+        output.to_string()
+    };
+
+    // Try to find valid CollabOutput JSON — scan from the end backwards
+    let bytes = cleaned.as_bytes();
+    let mut depth = 0i32;
+    let mut end_pos = None;
+
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'}' {
+            if depth == 0 { end_pos = Some(i); }
+            depth += 1;
+        } else if bytes[i] == b'{' {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(end) = end_pos {
+                    let json_str = &cleaned[i..=end];
+                    if let Ok(parsed) = serde_json::from_str::<CollabOutput>(json_str) {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_handles_null_fields() {
+        let input = r#"{"response": "hi", "delegate": null, "messages": null, "completed_tasks": null, "continue": false, "state_update": {}}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("hi"));
+        assert!(result.delegate.is_empty());
+        assert!(result.messages.is_empty());
+        assert!(result.completed_tasks.is_empty());
+        assert!(!result.r#continue);
+    }
+
+    #[test]
+    fn parse_handles_missing_fields() {
+        let input = r#"{"response": "hi"}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("hi"));
+        assert!(result.delegate.is_empty());
+        assert!(result.messages.is_empty());
+        assert!(result.completed_tasks.is_empty());
+    }
+
+    #[test]
+    fn parse_handles_markdown_fences() {
+        let input = "Here is the output:\n\n```json\n{\"response\": \"done\", \"continue\": false}\n```\n";
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn parse_handles_text_before_json() {
+        let input = "Let me check...\n\n{\"response\": \"found it\", \"continue\": false}";
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("found it"));
+    }
+
+    #[test]
+    fn parse_handles_text_after_json() {
+        let input = "{\"response\": \"all good\", \"continue\": false}\n\nHope that helps!";
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("all good"));
+    }
+
+    #[test]
+    fn parse_handles_nested_json_in_state() {
+        let input = r#"{"response": "ok", "state_update": {"status": "working", "files_touched": ["a.rs", "b.rs"]}, "continue": false}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("ok"));
+        assert_eq!(result.state_update.status.as_deref(), Some("working"));
+        assert_eq!(result.state_update.files_touched, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn parse_handles_empty_string() {
+        assert!(parse_collab_output("").is_none());
+    }
+
+    #[test]
+    fn parse_handles_no_json() {
+        assert!(parse_collab_output("Just some plain text response").is_none());
+    }
+
+    #[test]
+    fn parse_handles_invalid_json() {
+        assert!(parse_collab_output("{response: broken}").is_none());
+    }
+
+    #[test]
+    fn parse_handles_continue_true() {
+        let input = r#"{"response": null, "continue": true}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert!(result.response.is_none());
+        assert!(result.r#continue);
+    }
+
+    #[test]
+    fn parse_handles_messages_field() {
+        let input = r#"{"response": "sent", "messages": [{"to": "@frontend", "text": "API ready"}], "continue": false}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].to, "@frontend");
+        assert_eq!(result.messages[0].text, "API ready");
+    }
+
+    #[test]
+    fn parse_handles_delegate_field() {
+        let input = r#"{"response": "delegated", "delegate": [{"to": "@backend", "task": "fix the bug"}], "continue": false}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.delegate.len(), 1);
+        assert_eq!(result.delegate[0].to, "@backend");
+        assert_eq!(result.delegate[0].task, "fix the bug");
+    }
+
+    #[test]
+    fn parse_handles_completed_tasks() {
+        let input = r#"{"response": "done", "completed_tasks": ["abc123", "def456"], "continue": false}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.completed_tasks, vec!["abc123", "def456"]);
+    }
+
+    #[test]
+    fn parse_extracts_status_from_state() {
+        let input = r#"{"response": "ok", "state_update": {"status": "building UI"}, "continue": false}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.state_update.status.as_deref(), Some("building UI"));
+    }
+
+    #[test]
+    fn parse_handles_extra_unknown_fields() {
+        let input = r#"{"response": "ok", "unknown_field": 42, "another": "value", "continue": false}"#;
+        let result = parse_collab_output(input).expect("should parse");
+        assert_eq!(result.response.as_deref(), Some("ok"));
     }
 }
