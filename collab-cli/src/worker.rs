@@ -412,6 +412,14 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             msg_lines
         );
 
+        // Validate: error if template uses {model} but no model is set
+        if self.cli_template.contains("{model}") && self.model.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cli_template uses {{model}} but no model is configured.\n\
+                 Set 'model' in workers.yaml or pass --model to collab worker."
+            ));
+        }
+
         // Validate: catch unconfigured placeholder from collab init
         if self.cli_template.contains("{agent}") {
             return Err(anyhow::anyhow!(
@@ -424,18 +432,20 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             ));
         }
 
-        // Build command from cli_template — replace {prompt}, {model}, {workdir} placeholders
-        let expanded = self.cli_template
-            .replace("{prompt}", &prompt)
-            .replace("{model}", &self.model)
-            .replace("{workdir}", &self.workdir.to_string_lossy());
-
-        let parts = shlex::split(&expanded).ok_or_else(|| {
+        // Shell-split the template BEFORE substitution so {prompt} stays as one arg
+        let template_parts = shlex::split(&self.cli_template).ok_or_else(|| {
             anyhow::anyhow!("Invalid cli_template (bad quoting): {}", self.cli_template)
         })?;
-        if parts.is_empty() {
+        if template_parts.is_empty() {
             return Err(anyhow::anyhow!("cli_template expanded to empty command"));
         }
+
+        let workdir_str = self.workdir.to_string_lossy();
+        let parts: Vec<String> = template_parts.iter().map(|part| {
+            part.replace("{prompt}", &prompt)
+                .replace("{model}", &self.model)
+                .replace("{workdir}", &workdir_str)
+        }).collect();
 
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..])
@@ -558,15 +568,20 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             // Update state
             self.save_state(&collab_output.state_update);
         } else {
-            // Fallback: no markers found — treat entire stdout as the response
-            // But don't reply to self (boot messages)
+            // Fallback: no markers found
             let raw = stdout.trim().to_string();
             if !raw.is_empty() {
-                self.log(&format!("no markers — sending raw response"));
-                for msg in messages {
-                    if msg.sender != self.instance_id {
-                        if let Err(e) = self.client.add_message(&msg.sender, &raw, None).await {
-                            self.log_error(&format!("Failed to send response to @{}: {}", msg.sender, e));
+                // If it looks like a failed JSON parse (contains "response" key), don't send raw JSON
+                if raw.contains("\"response\"") && raw.contains("{") {
+                    self.log_error(&format!("JSON parse failed — output looks like structured JSON but couldn't be parsed. Not sending raw JSON to team."));
+                } else {
+                    // Plain text response — send it
+                    self.log(&format!("no markers — sending raw response"));
+                    for msg in messages {
+                        if msg.sender != self.instance_id {
+                            if let Err(e) = self.client.add_message(&msg.sender, &raw, None).await {
+                                self.log_error(&format!("Failed to send response to @{}: {}", msg.sender, e));
+                            }
                         }
                     }
                 }

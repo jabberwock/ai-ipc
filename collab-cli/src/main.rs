@@ -381,7 +381,7 @@ async fn main() -> Result<()> {
 
     if let Commands::Worker { workdir, model, cli_template, auto_reply, batch_wait } = cli.command {
         let workdir = workdir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let model = model.unwrap_or_else(|| "haiku".to_string());
+        let model = model.unwrap_or_default();
         let auto_reply = auto_reply.unwrap_or(true);
         let batch_wait = batch_wait.unwrap_or(2000);
 

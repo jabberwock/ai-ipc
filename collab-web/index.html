@@ -1346,7 +1346,7 @@ async function pollAll() {
 }
 
 async function loadHistory(id) {
-  try { S.histories[id] = await api(`/history/${id}`); } catch {}
+  try { S.histories[id] = await api(`/history/${id}?limit=200`); } catch {}
 }
 
 function isValidId(s) {

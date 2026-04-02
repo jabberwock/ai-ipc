@@ -249,40 +249,82 @@ async fn list_messages(
 
 async fn get_history(
     Path(instance_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Message>>, StatusCode> {
     if instance_id.len() > MAX_INSTANCE_ID_LEN || !is_valid_identifier(&instance_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let limit: Option<i64> = params.get("limit").and_then(|v| v.parse().ok()).filter(|&n| n > 0);
+
     let rows = if state.audit {
-        sqlx::query(
-            r#"
-            SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
-            FROM messages
-            WHERE (recipient = ? OR sender = ?)
-            ORDER BY timestamp ASC
-            "#,
-        )
-        .bind(&instance_id)
-        .bind(&instance_id)
-        .fetch_all(&state.db)
-        .await
+        if let Some(limit) = limit {
+            sqlx::query(
+                r#"
+                SELECT * FROM (
+                    SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+                    FROM messages
+                    WHERE (recipient = ? OR sender = ?)
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ) sub ORDER BY timestamp ASC
+                "#,
+            )
+            .bind(&instance_id)
+            .bind(&instance_id)
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+                FROM messages
+                WHERE (recipient = ? OR sender = ?)
+                ORDER BY timestamp ASC
+                "#,
+            )
+            .bind(&instance_id)
+            .bind(&instance_id)
+            .fetch_all(&state.db)
+            .await
+        }
     } else {
         let cutoff_iso = (Utc::now() - Duration::hours(8)).to_rfc3339();
-        sqlx::query(
-            r#"
-            SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
-            FROM messages
-            WHERE (recipient = ? OR sender = ?) AND timestamp >= ?
-            ORDER BY timestamp ASC
-            "#,
-        )
-        .bind(&instance_id)
-        .bind(&instance_id)
-        .bind(&cutoff_iso)
-        .fetch_all(&state.db)
-        .await
+        if let Some(limit) = limit {
+            sqlx::query(
+                r#"
+                SELECT * FROM (
+                    SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+                    FROM messages
+                    WHERE (recipient = ? OR sender = ?) AND timestamp >= ?
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ) sub ORDER BY timestamp ASC
+                "#,
+            )
+            .bind(&instance_id)
+            .bind(&instance_id)
+            .bind(&cutoff_iso)
+            .bind(limit)
+            .fetch_all(&state.db)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT id, hash, sender, recipient, content, refs, timestamp, read_at
+                FROM messages
+                WHERE (recipient = ? OR sender = ?) AND timestamp >= ?
+                ORDER BY timestamp ASC
+                "#,
+            )
+            .bind(&instance_id)
+            .bind(&instance_id)
+            .bind(&cutoff_iso)
+            .fetch_all(&state.db)
+            .await
+        }
     }
     .map_err(|e| {
         tracing::error!("Database error: {}", e);

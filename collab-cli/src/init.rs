@@ -13,17 +13,14 @@ pub struct ProjectConfig {
     pub output_dir: Option<String>,
     /// Path to the shared codebase that workers will exec from (e.g., ~/code/claude-ipc)
     pub codebase_path: Option<String>,
-    /// Default Claude model for all workers (e.g., haiku, sonnet) — can be overridden per-worker
-    #[serde(default = "default_model")]
-    pub model: String,
+    /// Default model for all workers — only needed if cli_template uses {model}
+    #[serde(default)]
+    pub model: Option<String>,
     /// CLI command template with {prompt}, {model}, {workdir} placeholders
     pub cli_template: Option<String>,
     pub workers: Vec<WorkerConfig>,
 }
 
-fn default_model() -> String {
-    "haiku".to_string()
-}
 
 fn default_server() -> String {
     "http://localhost:8000".to_string()
@@ -48,7 +45,7 @@ pub struct WorkerConfig {
 }
 
 impl ProjectConfig {
-    pub fn new(server: String, output_dir: Option<String>, codebase_path: Option<String>, model: String, workers: Vec<WorkerConfig>) -> Self {
+    pub fn new(server: String, output_dir: Option<String>, codebase_path: Option<String>, model: Option<String>, workers: Vec<WorkerConfig>) -> Self {
         Self { server, output_dir, codebase_path, model, cli_template: None, workers }
     }
 }
@@ -77,7 +74,10 @@ pub fn generate(config: &ProjectConfig, output_dir_override: Option<&str>) -> Re
     for worker in &config.workers {
         let dir = base.join(&worker.name);
         std::fs::create_dir_all(&dir)?;
-        let worker_model = worker.model.as_ref().unwrap_or(&config.model).clone();
+        let worker_model = worker.model.as_ref()
+            .or(config.model.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let md = render_claude_md(worker, &config.workers, &config.server, &config.codebase_path, &worker_model);
         let path = dir.join("AGENT.md");
         std::fs::write(&path, md)?;
@@ -325,7 +325,10 @@ fn write_worker_manifest(project_root: &Path, output_dir: &Path, config: &Projec
 
     let mut manifest_entries = Vec::new();
     for worker in &config.workers {
-        let worker_model = worker.model.as_ref().unwrap_or(&config.model).clone();
+        let worker_model = worker.model.as_ref()
+            .or(config.model.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let codebase_path = config.codebase_path.as_ref()
             .map(|p| p.clone())
             .unwrap_or_else(|| {

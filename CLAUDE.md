@@ -50,6 +50,7 @@ Create a `workers.yaml` file in your project:
 ```yaml
 server: http://localhost:8000
 cli_template: "claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit"
+model: haiku              # optional — only needed if cli_template uses {model}
 workers:
   - name: frontend
     role: "Frontend development"
@@ -57,7 +58,7 @@ workers:
     role: "Backend API development"
 ```
 
-The `cli_template` field specifies which AI CLI tool to use. Replace `claude` with your tool of choice (e.g., `cursor`, `ollama run {model} {prompt}`). Available placeholders: `{prompt}`, `{model}`, `{workdir}`. If omitted, `collab init` writes `{agent} -p {prompt} --model {model}` which must be edited before workers can start.
+The `cli_template` field specifies which AI CLI tool to use. Replace `claude` with your tool of choice (e.g., `cursor -p {prompt}`, `ollama run {model} {prompt}`). Available placeholders: `{prompt}`, `{model}`, `{workdir}`. The `model` field is optional — only required if your `cli_template` uses `{model}`. If `cli_template` is omitted, `collab init` writes `{agent} -p {prompt} --model {model}` which must be edited before workers can start.
 
 Run initialization:
 
