@@ -255,6 +255,9 @@ enum Commands {
     /// Print the path to the config file
     ConfigPath,
 
+    /// Show token usage from worker invocations
+    Usage,
+
     /// Manage persistent task queue (survives context resets)
     Todo {
         #[command(subcommand)]
@@ -450,6 +453,66 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if matches!(cli.command, Commands::Usage) {
+        let log_path = find_manifest()
+            .map(|p| p.parent().unwrap().join("usage.log"))
+            .unwrap_or_else(|_| std::path::PathBuf::from(".collab/usage.log"));
+
+        if !log_path.exists() {
+            println!("No usage data yet. Workers log to {} after each invocation.", log_path.display());
+            return Ok(());
+        }
+
+        let content = std::fs::read_to_string(&log_path)?;
+        let mut per_worker: std::collections::HashMap<String, (u64, u64, u64, u32)> = std::collections::HashMap::new();
+        let mut total_input: u64 = 0;
+        let mut total_output: u64 = 0;
+        let mut total_duration: u64 = 0;
+        let mut total_calls: u32 = 0;
+
+        for line in content.lines() {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 5 {
+                let worker = cols[1].to_string();
+                let dur: u64 = cols[2].parse().unwrap_or(0);
+                let inp: u64 = cols[3].parse().unwrap_or(0);
+                let out: u64 = cols[4].parse().unwrap_or(0);
+
+                total_input += inp;
+                total_output += out;
+                total_duration += dur;
+                total_calls += 1;
+
+                let entry = per_worker.entry(worker).or_insert((0, 0, 0, 0));
+                entry.0 += inp;
+                entry.1 += out;
+                entry.2 += dur;
+                entry.3 += 1;
+            }
+        }
+
+        println!("Token usage (estimated ~4 chars/token)\n");
+        println!("{:<20} {:>8} {:>8} {:>6} {:>6}", "Worker", "Input", "Output", "Calls", "Time");
+        println!("{}", "─".repeat(52));
+
+        let mut workers: Vec<_> = per_worker.iter().collect();
+        workers.sort_by(|a, b| (b.1.0 + b.1.1).cmp(&(a.1.0 + a.1.1)));
+
+        for (name, (inp, out, dur, calls)) in &workers {
+            println!("{:<20} {:>7}K {:>7}K {:>6} {:>5}s", name, inp / 1000, out / 1000, calls, dur);
+        }
+
+        println!("{}", "─".repeat(52));
+        println!("{:<20} {:>7}K {:>7}K {:>6} {:>5}s", "TOTAL", total_input / 1000, total_output / 1000, total_calls, total_duration);
+
+        // Rough cost estimate (haiku)
+        let input_cost = (total_input as f64 / 1_000_000.0) * 0.25;
+        let output_cost = (total_output as f64 / 1_000_000.0) * 1.25;
+        println!("\nEstimated cost (haiku): ${:.4}", input_cost + output_cost);
+
+        return Ok(());
+    }
+
     let instance_id = instance.ok_or_else(|| {
         anyhow::anyhow!(
             "Instance ID required. Set via --instance, $COLLAB_INSTANCE, or ~/.collab.toml\n\
@@ -523,7 +586,7 @@ async fn main() -> Result<()> {
             .join()
             .unwrap_or_else(|_| Err(anyhow::anyhow!("monitor panicked")))?;
         }
-        Commands::Roster | Commands::ConfigPath | Commands::Init { .. } | Commands::Start { .. } | Commands::Stop { .. } | Commands::Restart { .. } | Commands::LifecycleStatus => unreachable!(),
+        Commands::Roster | Commands::ConfigPath | Commands::Usage | Commands::Init { .. } | Commands::Start { .. } | Commands::Stop { .. } | Commands::Restart { .. } | Commands::LifecycleStatus => unreachable!(),
         #[allow(unreachable_patterns)]
         #[allow(unreachable_patterns)]
         _ => unreachable!(),
