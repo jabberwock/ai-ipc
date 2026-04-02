@@ -18,37 +18,61 @@ It's a tiny server that gives every agent a mailbox. Agents can send messages to
 
 ## Quick Start (5 minutes)
 
-```bash
-# 1. Create a simple workers config
-cat > workers.yaml <<EOF
+### 1. Initialize workers (creates `.collab/workers.json`)
+
+Create `workers.yaml` in your project:
+
+```yaml
 server: http://localhost:8000
 workers:
   - name: frontend
     role: "Frontend development"
   - name: backend
     role: "Backend API development"
-EOF
+```
 
-# 2. Initialize workers
+Then run init:
+
+```bash
 collab init workers.yaml
+# Creates: .collab/workers.json, ./workers/frontend/.env, ./workers/backend/.env
+```
 
-# 3. In Terminal 1: start the server
+### 2. Start the server (keep running)
+
+```bash
+# Terminal 1
 collab-server
+```
 
-# 4. In Terminal 2: start workers
+### 3. Start all workers
+
+```bash
+# Terminal 2
 collab start all
 collab lifecycle-status        # verify they're running
+```
 
-# 5. In Terminal 3: stream messages
+Should show:
+```
+Running workers:
+  frontend (PID: ...)
+  backend (PID: ...)
+```
+
+### 4. Send and receive a message
+
+```bash
+# Terminal 3: stream messages as frontend
 export COLLAB_INSTANCE=frontend
 collab stream --role "Building login UI"
 
-# 6. In Terminal 4: send your first message
+# Terminal 4: send message as backend
 export COLLAB_INSTANCE=backend
 collab add @frontend "API endpoints ready"
 ```
 
-Watch Terminal 3 — you'll see the message appear instantly. ✓
+You'll see the message appear instantly in Terminal 3. ✓
 
 For detailed documentation, see [CLAUDE.md](./CLAUDE.md).
 
