@@ -62,43 +62,61 @@ Run initialization:
 collab init workers.yaml
 ```
 
-### Step 2: Start Everything
+### Step 2: Start the Server and Workers
+
+Open two terminals side-by-side. In the first, start the server (keep it running):
 
 ```bash
-# Terminal 1: Start the server
+# Terminal 1 — keeps running
 collab-server
+```
 
-# Terminal 2: Start all workers with collab start
+In the second terminal, start the workers:
+
+```bash
+# Terminal 2
 collab start all
+```
 
-# Verify workers started
+Verify they're running:
+
+```bash
 collab lifecycle-status
 ```
 
-Output:
+Expected output:
 ```
 Running workers:
   frontend (PID: 12345)
   backend (PID: 12346)
 ```
 
-### Step 3: Send and Receive Messages
+✓ If you see this, you're good to go to Step 3.
 
-**In Terminal 3:**
+### Step 3: Send Your First Message
+
+Open a third terminal and start watching for messages:
+
 ```bash
+# Terminal 3
 export COLLAB_INSTANCE=frontend
 collab stream --role "Building login UI"
 ```
 
-**In Terminal 4:**
+Now in a fourth terminal, send a message from the backend worker:
+
 ```bash
+# Terminal 4
 export COLLAB_INSTANCE=backend
 collab add @frontend "Login endpoint ready at POST /auth/login"
 ```
 
-You'll see the message appear instantly in Terminal 3.
+Watch Terminal 3 — you'll see the message appear instantly. ✓
 
-That's it. You now have two independent Claude workers collaborating in real-time.
+**That's it.** You now have two independent Claude workers collaborating in real-time. From here, you can:
+- Run `collab stop all` to stop workers
+- Run `collab start all` to start them again  
+- Check the [Messaging Commands](#messaging-commands) section for more options
 
 ## Worker Management
 
