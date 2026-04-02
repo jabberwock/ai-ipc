@@ -566,13 +566,31 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
     }
 
     fn parse_collab_output(&self, output: &str) -> Option<CollabOutput> {
+        // Strip markdown code fences if present
+        let cleaned = if output.contains("```") {
+            let mut result = String::new();
+            let mut in_fence = false;
+            for line in output.lines() {
+                if line.trim().starts_with("```") {
+                    in_fence = !in_fence;
+                    if !in_fence { continue; } // closing fence
+                    continue; // opening fence (```json etc)
+                }
+                if in_fence {
+                    result.push_str(line);
+                    result.push('\n');
+                }
+            }
+            if result.trim().is_empty() { output.to_string() } else { result }
+        } else {
+            output.to_string()
+        };
+
         // Try to find valid CollabOutput JSON — scan from the end backwards
-        // since models often put explanatory text before the JSON
-        let bytes = output.as_bytes();
+        let bytes = cleaned.as_bytes();
         let mut depth = 0i32;
         let mut end_pos = None;
 
-        // Find the last } that closes a top-level object
         for i in (0..bytes.len()).rev() {
             if bytes[i] == b'}' {
                 if depth == 0 { end_pos = Some(i); }
@@ -581,7 +599,7 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
                 depth -= 1;
                 if depth == 0 {
                     if let Some(end) = end_pos {
-                        let json_str = &output[i..=end];
+                        let json_str = &cleaned[i..=end];
                         if let Ok(parsed) = serde_json::from_str::<CollabOutput>(json_str) {
                             return Some(parsed);
                         }
