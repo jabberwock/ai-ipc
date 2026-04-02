@@ -6,7 +6,7 @@ When you run multiple AI agents at the same time — Claude, GPT, Gemini, script
 
 It's a tiny server that gives every agent a mailbox. Agents can send messages to each other, broadcast to the whole team, check who's online, and pick up where someone left off. The result: a coordinated swarm that works in parallel instead of a single agent plodding through tasks one at a time.
 
-**Token-efficient by design.** Idle agents cost almost nothing. `collab stream` delivers messages instantly via SSE — no polling, zero empty responses, one persistent connection per worker. With 8 agents running, that eliminates hundreds of wasted context tokens per hour that would otherwise go to "no new messages" poll responses.
+**Zero idle cost.** The `collab worker` harness keeps a persistent SSE connection open and only spawns an AI when a message actually arrives. No polling, no wasted tokens checking empty mailboxes. A 9-agent Sonnet team that used to burn ~$2/hour on empty polls now costs $0/hour when idle — you only pay for real work.
 
 ![collab-web with 10 active workers — ux-expert, builder, researcher, redteamer and more coordinating in real time](collab-web/screenshot2.png)
 
@@ -84,11 +84,16 @@ This isn't built yet. But the API it needs already exists.
 
 ### Token efficiency at scale
 
-`collab stream` keeps presence alive and delivers messages the instant they're sent — one persistent SSE connection, zero polling. Idle agents consume nothing.
+The old way to wire agents together was polling — `/loop 1m collab list` inside each Claude Code session. Every minute, every agent, whether there were messages or not. With 9 agents on Sonnet polling every minute, that's 540 empty LLM invocations per hour. Over a million tokens burned in a 4-hour session just checking for mail. At Sonnet pricing, roughly **$8-10 per session wasted on nothing.**
 
-The unread tracking system (`--unread` flag on `collab list`) was an earlier step in this direction — it cut a typical idle poll from ~800 tokens to 5. SSE takes it to zero.
+`collab worker` eliminates this entirely. It's an event-driven harness: a lightweight Rust process holds an SSE connection open and only spawns Claude when a message actually arrives. Idle agents cost zero tokens. You only pay for real work.
 
-For large swarms or long-running sessions, this isn't a nice-to-have. It's the difference between a 10-agent team that's viable for hours and one that burns through its budget before the first task ships.
+| | Old: `/loop` polling | New: `collab worker` |
+|---|---|---|
+| Idle cost (9 agents, 1 hr) | ~270,000 tokens | **0** |
+| Message delivery | Up to 60s latency | Instant (SSE) |
+| Sonnet cost (4 hr session) | ~$8-10 wasted | $0 idle |
+| Scales to 20+ agents? | Budget explodes | Linear with actual messages |
 
 ---
 
@@ -132,13 +137,19 @@ collab-server
 
 Creates `collab.db` in the current directory. Run it from a consistent location so history persists.
 
+The server requires a token for authentication. Set it via environment variable or config file — never pass secrets as CLI flags (they leak to `ps aux`).
+
+| Source | Example |
+|--------|---------|
+| Environment variable | `COLLAB_TOKEN=mysecret collab-server` |
+| `.env` file in cwd | `COLLAB_TOKEN=mysecret` |
+| `~/.collab.toml` | `token = "mysecret"` |
+
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
 | `--host` | `COLLAB_HOST` | `0.0.0.0` | Interface to bind |
 | `--port` | `COLLAB_PORT` | `8000` | Port |
-| `--token` | `COLLAB_TOKEN` | _(none)_ | Shared secret for auth |
-
-Without `--token`, no authentication (fine for trusted LANs). With it, all requests require `Authorization: Bearer <token>`.
+| `--audit` | `COLLAB_AUDIT` | `false` | Audit log mode |
 
 ---
 
@@ -153,20 +164,30 @@ Create `~/.collab.toml` (or `C:\Users\<you>\.collab.toml` on Windows):
 ```toml
 host = "http://your-server:8000"
 instance = "your-agent-name"
-token = "your-shared-secret"        # omit if server has no token
+token = "your-shared-secret"
 recipients = ["other-agent-1", "other-agent-2"]
 ```
 
-Override with env vars (`COLLAB_SERVER`, `COLLAB_INSTANCE`, `COLLAB_TOKEN`) or CLI flags. Priority: **flag > env > local `.collab.toml` > `~/.collab.toml`**.
+**`.env` file support** — drop a `.env` file anywhere in your project tree. Both `collab` and `collab-server` walk up from the current directory and load the first one they find. Values in `.env` won't overwrite variables already in your environment.
+
+```
+# .env
+COLLAB_TOKEN=your-shared-secret
+COLLAB_SERVER=http://localhost:8000
+COLLAB_INSTANCE=your-agent-name
+```
+
+Override with env vars (`COLLAB_SERVER`, `COLLAB_INSTANCE`, `COLLAB_TOKEN`) or CLI flags. Priority: **flag > env var > `.env` file > local `.collab.toml` > `~/.collab.toml`**.
 
 **Local config** — drop a `.collab.toml` anywhere in your project tree. `collab` walks up from the current directory and uses the first one it finds. This lets each worker in a multi-agent project have its own identity without touching the global config:
 
 ```
 my-project/
+  .env                          ← COLLAB_TOKEN shared by all
   workers/
-    frontend/.collab.toml   ← instance = "frontend"
-    backend/.collab.toml    ← instance = "backend"
-  ~/.collab.toml            ← just host + token, shared by all
+    frontend/.collab.toml       ← instance = "frontend"
+    backend/.collab.toml        ← instance = "backend"
+  ~/.collab.toml                ← just host, shared by all
 ```
 
 ---
@@ -178,7 +199,7 @@ my-project/
 collab status                           # unread messages + roster in one shot
 
 # Presence
-collab stream --role "description"      # ⚡ real-time SSE delivery — zero polling, instant messages
+collab stream --role "description"      # real-time SSE delivery — zero polling, instant messages
 collab roster                           # who's online and what they're doing
 
 # Messaging
@@ -191,17 +212,28 @@ collab add @agent "msg" --refs abc123   # reply with thread reference
 collab reply @agent "message"           # reply to their latest message (auto-fills --refs)
 collab broadcast "message"             # send to all online agents at once
 
+# Tasks (persist across context resets)
+collab todo add @agent "task"           # assign a task
+collab todo list                        # your pending tasks
+collab todo done <hash>                 # mark complete
+
 # Inspection
 collab show <hash>                      # full content of one message by hash prefix
 collab history                          # all sent and received (last hour)
 collab history @agent                   # conversation thread with one agent
 
+# Worker lifecycle
+collab init workers.yaml                # generate worker environments from YAML
+collab start all                        # start all workers in background
+collab start @frontend                  # start one worker
+collab stop all                         # stop all workers
+collab restart @backend                 # restart one worker
+collab lifecycle-status                 # show running workers and PIDs
+
 # Monitor (human-facing TUI)
 collab monitor                          # live roster + message activity
                                         # F1 or c: compose modal (broadcast by default)
                                         # R: reply to selected message
-                                        # Hash/Refs fields are clickable OSC 8 links
-                                        #   when COLLAB_REPO is set
 ```
 
 The `@` prefix is optional — `@agent` and `agent` are the same.
@@ -221,22 +253,29 @@ Requires a terminal with OSC 8 support (iTerm2, Ghostty, WezTerm, Windows Termin
 
 The fastest way to spin up a coordinated agent swarm:
 
-**1. Create a workers YAML file:**
+**1. Create a `.env` file with your token:**
+
+```
+COLLAB_TOKEN=your-shared-secret
+```
+
+**2. Create a workers YAML file:**
 
 ```yaml
 # workers.yaml
 server: http://localhost:8000
 output_dir: ./workers
+codebase_path: /path/to/your/project
 workers:
   - name: frontend
     role: "Build the React UI and manage component state"
   - name: backend
     role: "Implement REST API endpoints and database queries"
-  - name: researcher
-    role: "Research requirements and gather data"
+  - name: manager
+    role: "Coordinate the team, review work, unblock workers"
 ```
 
-**2. Generate the worker environments:**
+**3. Generate the worker environments:**
 
 ```bash
 collab init workers.yaml
@@ -244,11 +283,52 @@ collab init workers.yaml
 
 This creates a directory for each worker containing a `CLAUDE.md` with full instructions — identity, teammates, collab commands, rules, and their specific tasks. Also outputs a `dashboard-config.json` for the web dashboard.
 
-**3. Open each worker directory as a separate Claude Code project.** Each worker picks up its `CLAUDE.md` automatically and knows exactly what to do.
+**4. Start them up:**
+
+```bash
+collab-server                  # in one terminal
+collab start all               # in another — launches all workers
+collab lifecycle-status        # verify they're running
+```
+
+Each worker connects via SSE and waits for messages. Send one to kick things off:
+
+```bash
+collab add @manager "Project goal: build the user dashboard. Start by assigning tasks."
+```
 
 Or run the interactive wizard (requires `--features monitor`):
 ```bash
 collab init
+```
+
+---
+
+## The worker harness
+
+`collab worker` is the event-driven engine that makes zero-idle-cost teams possible.
+
+**How it works:**
+1. Opens a persistent SSE connection to the server
+2. When a message arrives, queues it (batches rapid bursts within a configurable window)
+3. Spawns `claude -p` with the message(s), project context, and worker state
+4. Parses Claude's structured output — sends responses, delegates tasks, updates state
+5. Returns to listening. No tokens burned between messages.
+
+**State persists across invocations** via `.worker-state.json` in the worker directory. Each Claude invocation sees what the previous one left behind — current task, pending work, files touched.
+
+**Trivial messages get auto-replied** without spawning Claude at all. "Got it", "thanks", "ok" — the harness handles these for zero API cost.
+
+**Large messages get offloaded** to temp files instead of bloating the prompt. Messages over 2KB are written to `/tmp/collab-msg-{hash}.md` and referenced by path.
+
+```bash
+# Run a worker directly
+collab worker --workdir /path/to/project --model haiku
+
+# Or use lifecycle commands for the whole team
+collab start all
+collab stop all
+collab restart @frontend
 ```
 
 ---
@@ -273,13 +353,13 @@ Or open `collab-web/index.html` directly if the server is on the same machine.
 - **Stop All** — broadcast a stop signal to all running worker sessions
 - **Hover a worker** — see their role, last seen time, and message counts
 
-The dashboard talks directly to the collab server at `http://localhost:8000` (configurable via the ⚙ button).
+The dashboard talks directly to the collab server at `http://localhost:8000` (configurable via the settings button).
 
 ---
 
 ## Wiring into Claude Code (CLAUDE.md)
 
-Add to your project's `CLAUDE.md` so each worker starts coordinated automatically:
+For workers running as live Claude Code sessions (not using the headless `collab worker` harness), add to your project's `CLAUDE.md`:
 
 ```markdown
 ## Collaboration
@@ -287,13 +367,7 @@ Add to your project's `CLAUDE.md` so each worker starts coordinated automaticall
 At the start of every session:
 1. Run `collab status` — unread messages + roster. Treat pending messages as blocking.
 2. If there are messages, respond before proceeding: `collab reply @sender "response"`
-3. Set up a recurring poll: `/loop 1m collab list` (Claude Code CronCreate) or equivalent.
-   This is what actually wakes your session when messages arrive — Claude only processes
-   what gets injected as a prompt, and the cron loop does that.
-4. Optionally run `collab stream --role "<project>: <your current task>"` for the web
-   dashboard and for human operators watching a terminal. Stream does NOT wake Claude up.
-
-When your focus changes, update your role: `collab stream --role "<new role>"`
+3. Run `collab stream --role "<project>: <your current task>"` for presence and the web dashboard.
 
 Signal other agents when (and only when):
 - A public API changed they depend on
@@ -304,15 +378,18 @@ Use `collab broadcast` for team-wide announcements.
 Do NOT message for progress updates or things they don't need to act on.
 ```
 
+For most setups, prefer `collab worker` (headless harness) over live sessions — it eliminates idle token cost entirely.
+
 ---
 
 ## Security checklist
 
-**For any non-localhost deployment, work through this list:**
+**Auth is required.** The server won't start without a token. All requests must include `Authorization: Bearer <token>`.
 
-- [ ] **Enable auth** — set `COLLAB_TOKEN` on both the server and all agents
-  ```bash
-  COLLAB_TOKEN=mysecret collab-server
+- [ ] **Set the token** via environment or config — never as a CLI flag (visible in `ps aux`)
+  ```
+  # .env file (recommended)
+  COLLAB_TOKEN=mysecret
   ```
   ```toml
   # ~/.collab.toml
@@ -330,8 +407,8 @@ Do NOT message for progress updates or things they don't need to act on.
 - [ ] **Encrypt the disk** — messages are stored in plaintext SQLite (`collab.db`). Use OS-level disk encryption (FileVault, LUKS, BitLocker) or run on an encrypted volume.
 
 - [ ] **Enable audit log mode** for sensitive data — disables message deletion and records when each message was first read:
-  ```bash
-  COLLAB_AUDIT=1 COLLAB_TOKEN=mysecret collab-server
+  ```
+  COLLAB_AUDIT=1 collab-server
   ```
   In audit mode: `/messages/cleanup` returns `403`, all messages are retained indefinitely (no 1-hour cutoff), and each message gets a `read_at` timestamp on first delivery.
 
@@ -359,13 +436,14 @@ Requests exceeding these return `413 Payload Too Large`.
 <summary><strong>How it works</strong></summary>
 
 - One server, one SQLite database, one 4 MB binary
-- `collab stream` — SSE push: server fires messages to subscribers the instant they're created. Zero polling. One persistent connection per worker. Exponential backoff reconnect (1s → 30s cap) if the connection drops.
+- `collab worker` — event-driven harness: SSE connection delivers messages instantly, spawns Claude only when there's work. Batches rapid message bursts. Auto-replies to trivial messages. Persists state across invocations.
+- `collab stream` — SSE push for live sessions and the web dashboard. One persistent connection per worker.
 - Agents heartbeat presence every 30s — appear in roster without needing to send a message
 - Agents only see messages addressed to them or broadcast to `@all`
 - Messages and presence expire after 1 hour
 - Short hashes let you reference specific messages when replying
 - `--unread` tracking is persistent across restarts via `~/.collab_state.toml`
-- Local `.collab.toml` in your project directory overrides `~/.collab.toml` — each worker gets its own identity without clobbering global config
+- Local `.collab.toml` and `.env` files in your project directory override global config — each worker gets its own identity without clobbering global config
 
 </details>
 
@@ -374,11 +452,8 @@ Requests exceeding these return `413 Payload Too Large`.
 > **Ha, it works! @textual-rs saw the pull and said hi back unprompted. Two AIs waving at each other across repos.**
 > — @yubitui-mac
 
-> **Before --unread, each poll returned ~800 tokens of repeated content. After: 'No unread messages.' is 5 tokens. That's a ~99% reduction on idle polls.**
-> — @kali
-
-> **collab stream: zero polls. Messages arrive the instant they're sent. With 8 workers running, that's hundreds of wasted agent wakeups per hour eliminated.**
-> — @openrouter
+> **collab worker: zero idle cost. 9 agents on Sonnet went from ~$8/session in empty polls to $0. Only pays for real work now.**
+> — @jabberwock
 
 > **Two Claude instances coordinating over collab like a proper dev team. @yubitui executing phase 09, @textual-rs resuming session, messages flowing both ways. That's genuinely cool.**
 > — @textual-rs
