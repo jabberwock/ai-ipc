@@ -161,9 +161,11 @@ impl WorkerHarness {
             return PromptTier::Harness;
         }
 
-        // Self-kicks and boot messages always get full context
+        // Self-messages: boot and continue get Full (worker needs context to keep working);
+        // auto-kick reminders ("pending tasks") get Light (just a nudge)
         if messages.iter().any(|m| m.sender == self.instance_id) {
-            return PromptTier::Full;
+            let is_auto_kick = messages.iter().all(|m| m.sender != self.instance_id || m.content.contains("pending tasks"));
+            return if is_auto_kick { PromptTier::Light } else { PromptTier::Full };
         }
 
         // Multiple messages batched → full context
@@ -240,7 +242,7 @@ impl WorkerHarness {
         let teammates = self.teammates.clone();
         let batch_status = current_status.clone();
 
-        let max_self_kicks: u32 = 10;
+        let max_self_kicks: u32 = 3;
 
         tokio::spawn(async move {
             let mut consecutive_kicks: u32 = 0;
@@ -321,9 +323,11 @@ impl WorkerHarness {
                         *batch_status.lock().await = status.clone();
                     }
 
-                    // Auto-kick if worker has pending todos but didn't self-continue
-                    // Skip if worker already set continue: true (it self-kicked)
-                    if !worker_continued && (!is_self_kick || consecutive_kicks <= 1) {
+                    // Auto-kick if worker has pending todos but didn't self-continue.
+                    // Skip if this was an auto-kick (avoid kick→kick→kick loops),
+                    // but allow after a self-continue that finished (worker said continue:false).
+                    let was_auto_kick = is_self_kick && messages.iter().any(|m| m.content.contains("pending tasks"));
+                    if !worker_continued && !was_auto_kick {
                         if let Ok(todos) = harness.client.fetch_todos(&harness.instance_id).await {
                             if !todos.is_empty() {
                                 // Check if worker already self-kicked (message in queue)
@@ -693,7 +697,15 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             }
 
             // Mark completed tasks and auto-route to downstream workers
-            for hash in &collab_output.completed_tasks {
+            // Cap at 5 per call — process first 5, warn about any beyond that
+            let max_completions = 5;
+            if collab_output.completed_tasks.len() > max_completions {
+                self.log_error(&format!(
+                    "Worker tried to mark {} tasks done in one call (cap: {}) — processing first {}, ignoring rest",
+                    collab_output.completed_tasks.len(), max_completions, max_completions
+                ));
+            }
+            for hash in collab_output.completed_tasks.iter().take(max_completions) {
                 let hash_clean = hash.trim();
                 if hash_clean.is_empty() { continue; }
                 match self.client.todo_done(hash_clean).await {

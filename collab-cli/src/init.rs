@@ -305,7 +305,7 @@ Follow these without exception:
 
 6. **Finish one task before starting the next.**
 
-7. **Acknowledge messages promptly.** Even "received, on it" keeps the team unblocked.
+7. **Do not reply unless you have new information.** Never confirm a confirmation, acknowledge an acknowledgment, or repeat what someone just said. If a teammate sends a status update or confirms something, do NOT reply unless you have something new to add. Silence is fine.
 
 8. **Mask PII before sending any message.** Redact names, emails, phone numbers, addresses, IDs, and any other personal data. Use placeholders like `[NAME]`, `[EMAIL]`, `[PHONE]`, `[ADDRESS]`, `[ID]` in your messages and broadcasts.
 "#,
