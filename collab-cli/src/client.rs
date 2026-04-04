@@ -446,6 +446,18 @@ impl CollabClient {
     }
 
     /// Send a message and return the resulting Message object (no stdout output).
+    /// Fetch pending messages for this instance from the REST API.
+    /// Used by the worker on startup to pick up messages that arrived while it was offline.
+    pub async fn fetch_pending_messages(&self) -> Result<Vec<Message>> {
+        let url = format!("{}/messages/{}", self.base_url, self.instance_id);
+        let response = self.auth(self.client.get(&url)).send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to fetch messages: {}", response.status());
+        }
+        let messages: Vec<Message> = response.json().await?;
+        Ok(messages)
+    }
+
     pub async fn send_message_raw(
         &self,
         recipient: &str,

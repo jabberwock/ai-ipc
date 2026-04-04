@@ -444,6 +444,30 @@ impl WorkerHarness {
                     backoff_secs = 1;
                     self.log(&format!("idle — listening for @{}", self.instance_id));
 
+                    // On connect, fetch any messages that arrived while offline and queue them
+                    match self.client.fetch_pending_messages().await {
+                        Ok(pending) => {
+                            let mut queue = self.message_queue.lock().await;
+                            for msg in pending {
+                                // Skip self-messages — they're noise
+                                if msg.sender != self.instance_id {
+                                    queue.push(Message {
+                                        sender: msg.sender,
+                                        content: msg.content,
+                                        hash: msg.hash,
+                                        timestamp: msg.timestamp,
+                                        recipient: msg.recipient,
+                                    });
+                                }
+                            }
+                            if !queue.is_empty() {
+                                *self.first_message_time.lock().await = Some(Instant::now());
+                                self.log(&format!("queued {} offline message(s)", queue.len()));
+                            }
+                        }
+                        Err(e) => self.log_error(&format!("Failed to fetch pending messages: {}", e)),
+                    }
+
                     // Auto-kick: send boot message AFTER SSE is connected (only once)
                     if !booted {
                         booted = true;
