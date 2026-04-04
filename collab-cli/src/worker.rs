@@ -304,8 +304,10 @@ impl WorkerHarness {
                 };
                 *first_time.lock().await = None;
 
-                // Check if this is a self-kick (message from self)
-                let has_external = messages.iter().any(|m| m.sender != instance_id);
+                // Always strip self-messages before building prompt — never feed them as input
+                messages.retain(|m| m.sender != instance_id);
+
+                let has_external = !messages.is_empty();
                 let is_self_kick = !has_external;
                 if is_self_kick {
                     consecutive_kicks += 1;
@@ -317,8 +319,6 @@ impl WorkerHarness {
                     }
                 } else {
                     consecutive_kicks = 0;
-                    // Strip self-kicks from mixed batches — only process external messages
-                    messages.retain(|m| m.sender != instance_id);
                 }
 
                 let harness = WorkerHarness {
@@ -681,11 +681,18 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
         }
 
         let workdir_str = self.workdir.to_string_lossy();
-        let parts: Vec<String> = template_parts.iter().map(|part| {
+        let mut parts: Vec<String> = template_parts.iter().map(|part| {
             part.replace("{prompt}", &prompt)
                 .replace("{model}", &self.model)
                 .replace("{workdir}", &workdir_str)
         }).collect();
+
+        // Detect claude CLI — inject --output-format json to get real token counts and cost
+        let is_claude_cli = parts[0].ends_with("claude");
+        if is_claude_cli {
+            parts.push("--output-format".to_string());
+            parts.push("json".to_string());
+        }
 
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..])
@@ -725,7 +732,32 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             return Err(anyhow::anyhow!("CLI failed: {}", detail));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let raw_stdout = String::from_utf8_lossy(&output.stdout);
+
+        // For claude CLI: unwrap --output-format json envelope to get real token counts and cost
+        let (stdout, real_input_tokens, real_output_tokens, cost_usd) = if is_claude_cli {
+            match serde_json::from_str::<serde_json::Value>(&raw_stdout) {
+                Ok(v) => {
+                    let inner = v.get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input_tok = v.pointer("/usage/input_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
+                        + v.pointer("/usage/cache_creation_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
+                        + v.pointer("/usage/cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let output_tok = v.pointer("/usage/output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                    let cost = v.get("total_cost_usd").and_then(|c| c.as_f64());
+                    (std::borrow::Cow::Owned(inner), input_tok, output_tok, cost)
+                }
+                Err(e) => {
+                    self.log_error(&format!("Failed to parse claude JSON envelope: {e}"));
+                    (raw_stdout, 0u64, 0u64, None)
+                }
+            }
+        } else {
+            (raw_stdout, 0u64, 0u64, None)
+        };
+
         let duration = start.elapsed().as_secs();
 
         // Parse structured output
@@ -838,22 +870,25 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             }
         }
 
-        // Token usage estimate (~4 chars per token) and log
-        let input_chars = prompt.len();
-        let output_chars = stdout.len();
-        let est_input_tokens = input_chars / 4;
-        let est_output_tokens = output_chars / 4;
-        self.log(&format!("done — {}s, ~{}+{} tokens", duration, est_input_tokens, est_output_tokens));
+        // Token usage — real counts from claude JSON envelope, estimates for other CLIs
+        let (log_input_tokens, log_output_tokens) = if is_claude_cli {
+            (real_input_tokens, real_output_tokens)
+        } else {
+            (prompt.len() as u64 / 4, stdout.len() as u64 / 4)
+        };
+        let cost_str = cost_usd.map(|c| format!(", ${:.4}", c)).unwrap_or_default();
+        self.log(&format!("done — {}s, {}+{} tokens{}", duration, log_input_tokens, log_output_tokens, cost_str));
 
         // Append to usage log
-        let log_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        let log_line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
             self.instance_id,
             duration,
-            est_input_tokens,
-            est_output_tokens,
+            log_input_tokens,
+            log_output_tokens,
             self.cli_template.split_whitespace().next().unwrap_or("unknown"),
-            tier
+            tier,
+            cost_usd.map(|c| format!("{:.6}", c)).unwrap_or_default()
         );
         let log_path = self.workdir.join("../../.collab/usage.log");
         let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
