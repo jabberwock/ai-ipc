@@ -974,6 +974,12 @@ const S = {
   inboxMode:   false,
   tabMode:     'messages', // 'messages' | 'todos'
   todos:       {},   // instance_id → Todo[]
+  msgHistory:  JSON.parse(localStorage.getItem('collab-msg-history') || '[]'),  // last 10 sent messages
+  msgHistIdx:  -1,
+  msgHistDraft: '',
+  todoHistory: JSON.parse(localStorage.getItem('collab-todo-history') || '[]'), // last 10 sent todos
+  todoHistIdx: -1,
+  todoHistDraft: '',
 };
 
 document.getElementById('server-url').value = S.url;
@@ -1804,6 +1810,14 @@ async function handleSend() {
   if (!content) return;
 
   localStorage.setItem('collab-from', from);
+  // Save to message history (keep last 10)
+  const rawText = inputEl.value.trim();
+  if (rawText) {
+    S.msgHistory = [rawText, ...S.msgHistory.filter(h => h !== rawText)].slice(0, 10);
+    localStorage.setItem('collab-msg-history', JSON.stringify(S.msgHistory));
+    S.msgHistIdx = -1;
+    S.msgHistDraft = '';
+  }
   inputEl.value = '';
   inputEl.style.height = 'auto';
   const savedImage = pendingImage;
@@ -1879,6 +1893,25 @@ document.getElementById('compose-input').addEventListener('keydown', e => {
     if (e.key === 'Escape') { closeMentionList(); return; }
   }
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+  // Message history (up/down) — only when no autocomplete menus are open
+  if (e.key === 'ArrowUp' && !S.msgHistory.length) return;
+  if (e.key === 'ArrowUp') {
+    const el = document.getElementById('compose-input');
+    // Only activate from start of input or empty
+    if (el.selectionStart !== 0 && el.value) return;
+    e.preventDefault();
+    if (S.msgHistIdx === -1) S.msgHistDraft = el.value;
+    if (S.msgHistIdx < S.msgHistory.length - 1) {
+      S.msgHistIdx++;
+      el.value = S.msgHistory[S.msgHistIdx];
+    }
+  }
+  if (e.key === 'ArrowDown' && S.msgHistIdx >= 0) {
+    const el = document.getElementById('compose-input');
+    e.preventDefault();
+    S.msgHistIdx--;
+    el.value = S.msgHistIdx >= 0 ? S.msgHistory[S.msgHistIdx] : S.msgHistDraft;
+  }
 });
 
 // ── Image paste ───────────────────────────────────────────────────────────────
@@ -1928,9 +1961,11 @@ async function loadTodos(id) {
 }
 
 async function pollTodos() {
-  if (!S.workers.length) return;
-  await Promise.allSettled(S.workers.map(w => loadTodos(w.instance_id)));
+  const me = document.getElementById('compose-name').value.trim();
+  if (me) S.knownWorkerIds.add(me);
   S.workers.forEach(w => S.knownWorkerIds.add(w.instance_id));
+  if (!S.knownWorkerIds.size) return;
+  await Promise.allSettled([...S.knownWorkerIds].map(id => loadTodos(id)));
   document.getElementById('todo-to-list').innerHTML = [...S.knownWorkerIds].sort().map(id => `<option value="${esc(id)}">`).join('');
   const total = Object.values(S.todos).reduce((n, arr) => n + arr.length, 0);
   // Hide badge when viewing tasks tab
@@ -2035,6 +2070,12 @@ async function submitTodo() {
   btn.disabled = true;
   try {
     await api('/todos', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ assigned_by: from, instance: to, description: desc }) });
+    // Save to todo history (keep last 10) — store "to: desc" so recipient is recalled
+    const todoEntry = `@${to} ${desc}`;
+    S.todoHistory = [todoEntry, ...S.todoHistory.filter(h => h !== todoEntry)].slice(0, 10);
+    localStorage.setItem('collab-todo-history', JSON.stringify(S.todoHistory));
+    S.todoHistIdx = -1;
+    S.todoHistDraft = '';
     document.getElementById('todo-desc').value = '';
     await pollTodos();
   } catch (e) { console.error('[addTodo]', e); }
@@ -2042,7 +2083,35 @@ async function submitTodo() {
 }
 
 document.getElementById('todo-send').addEventListener('click', submitTodo);
-document.getElementById('todo-desc').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitTodo(); } });
+document.getElementById('todo-desc').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitTodo(); return; }
+  if (e.key === 'ArrowUp' && S.todoHistory.length) {
+    const el = document.getElementById('todo-desc');
+    if (el.selectionStart !== 0 && el.value) return;
+    e.preventDefault();
+    if (S.todoHistIdx === -1) S.todoHistDraft = el.value;
+    if (S.todoHistIdx < S.todoHistory.length - 1) {
+      S.todoHistIdx++;
+      const entry = S.todoHistory[S.todoHistIdx];
+      const m = entry.match(/^@(\S+)\s+([\s\S]*)$/);
+      if (m) { document.getElementById('todo-to').value = m[1]; el.value = m[2]; }
+      else { el.value = entry; }
+    }
+  }
+  if (e.key === 'ArrowDown' && S.todoHistIdx >= 0) {
+    const el = document.getElementById('todo-desc');
+    e.preventDefault();
+    S.todoHistIdx--;
+    if (S.todoHistIdx >= 0) {
+      const entry = S.todoHistory[S.todoHistIdx];
+      const m = entry.match(/^@(\S+)\s+([\s\S]*)$/);
+      if (m) { document.getElementById('todo-to').value = m[1]; el.value = m[2]; }
+      else { el.value = entry; }
+    } else {
+      el.value = S.todoHistDraft;
+    }
+  }
+});
 
 
 // Re-compute inbox count when your name changes

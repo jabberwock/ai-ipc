@@ -153,6 +153,10 @@ enum TodoAction {
         /// Show tasks for a specific instance instead of yourself
         #[arg(value_name = "@INSTANCE")]
         instance: Option<String>,
+
+        /// Alias: show tasks for a specific instance (e.g., --for @d4-stats)
+        #[arg(long = "for", value_name = "INSTANCE")]
+        for_instance: Option<String>,
     },
 
     /// Mark a task complete
@@ -626,9 +630,10 @@ async fn main() -> Result<()> {
                 let instance = instance.trim_start_matches('@');
                 client.todo_add(instance, &description).await?;
             }
-            TodoAction::List { instance } => {
-                let instance = instance.as_deref().map(|s| s.trim_start_matches('@'));
-                client.todo_list(instance).await?;
+            TodoAction::List { instance, for_instance } => {
+                let target = for_instance.as_deref().or(instance.as_deref());
+                let target = target.map(|s| s.trim_start_matches('@'));
+                client.todo_list(target).await?;
             }
             TodoAction::Done { hash } => {
                 client.todo_done(&hash).await?;

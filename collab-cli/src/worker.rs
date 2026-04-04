@@ -617,6 +617,32 @@ Do NOT run any collab CLI commands. Focus on your actual work.",
             lines
         };
 
+        // Fetch recent message history for conversational context
+        let current_hashes: std::collections::HashSet<_> = messages.iter().map(|m| m.hash.as_str()).collect();
+        let history_str = match self.client.fetch_history_pub(&self.instance_id).await {
+            Ok(history) => {
+                let recent: Vec<_> = history.iter()
+                    .filter(|m| !current_hashes.contains(m.hash.as_str()))
+                    .rev()
+                    .take(20)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if recent.is_empty() {
+                    String::new()
+                } else {
+                    let mut lines = String::from("Recent conversation history (for context — do NOT re-process these, only act on the new messages below):\n");
+                    for m in &recent {
+                        let content = if m.content.len() > 300 { format!("{}…", &m.content[..300]) } else { m.content.clone() };
+                        lines.push_str(&format!("  @{} → @{}: {}\n", m.sender, m.recipient, content));
+                    }
+                    lines
+                }
+            }
+            Err(_) => String::new(),
+        };
+
         Ok(format!(
             "You are @{}. Role: {}
 
@@ -627,10 +653,11 @@ Previous state:
 
 {}
 
-Messages ({}):
+{}
+New messages ({}):
 {}
 
-Act on the messages above. Use Bash/Read/Write/Edit to do your actual work (coding, research, testing).
+Act on the new messages above. Use Bash/Read/Write/Edit to do your actual work (coding, research, testing).
 
 When done, your FINAL output must be ONLY a JSON object (no other text before or after):
 
@@ -645,7 +672,7 @@ When done, your FINAL output must be ONLY a JSON object (no other text before or
 
 Fields:
 - response: reply back to whoever messaged you
-- delegate: assign tasks to teammates — creates a persistent todo and pings them. IMPORTANT: if you want a teammate to do something, you MUST use delegate — do NOT put task assignments in response or messages, those are ephemeral and will be lost on context reset
+- delegate: assign tasks to ANY instance (teammates, humans, anyone) — creates a persistent todo and pings them. If someone messages you asking for something and you need THEM to act, delegate back to THEM — not to a random teammate. IMPORTANT: do NOT put task assignments in response or messages, those are ephemeral and will be lost on context reset. The task description MUST be self-contained: include all facts, URLs, decisions, and context the recipient needs — they will NOT see the original messages that led to this task
 - messages: send messages to any teammate directly — for status updates and context only, NOT for assigning work (optional)
 - completed_tasks: task hashes you finished — marks done and routes to downstream workers (optional)
 - continue: true to keep working autonomously, false when blocked or done
@@ -657,6 +684,7 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
             teammates_str,
             state_str,
             todos_str,
+            history_str,
             messages.len(),
             msg_lines
         ))
@@ -787,12 +815,20 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
         // Parse structured output
         let mut did_continue = false;
         if let Some(collab_output) = self.parse_collab_output(&stdout) {
-            // Send response once per unique sender (skip self)
+            // Build set of delegate targets to avoid duplicate messages
+            let delegated_to: std::collections::HashSet<String> = collab_output.delegate.iter()
+                .map(|t| t.to.trim_start_matches('@').to_string())
+                .collect();
+
+            // Send response once per unique sender (skip self and delegate targets)
             let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
             if let Some(response) = &collab_output.response {
                 if !response.is_empty() {
                     for msg in messages {
-                        if msg.sender != self.instance_id && replied.insert(msg.sender.clone()) {
+                        if msg.sender != self.instance_id
+                            && !delegated_to.contains(&msg.sender)
+                            && replied.insert(msg.sender.clone())
+                        {
                             if let Err(e) = self.client.add_message(&msg.sender, response, None).await {
                                 self.log_error(&format!("Failed to send response to @{}: {}", msg.sender, e));
                             }
@@ -801,26 +837,21 @@ Do NOT run any collab CLI commands. The harness handles all messaging and task d
                 }
             }
 
-            // Delegate tasks — create todo AND ping the worker to wake them up
-            if !collab_output.delegate.is_empty() {
-                let mut notified: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for task in &collab_output.delegate {
-                    let to = task.to.trim_start_matches('@');
-                    if let Err(e) = self.client.todo_add(to, &task.task).await {
-                        self.log_error(&format!("Failed to add todo for @{}: {}", to, e));
-                    } else if notified.insert(to.to_string()) {
-                        // One ping per worker, not per task — the todo list has the details
-                        let notify = format!("New task assigned — check your todo list.");
-                        if let Err(e) = self.client.add_message(to, &notify, None).await {
-                            self.log_error(&format!("Failed to notify @{}: {}", to, e));
-                        }
-                    }
+            // Delegate tasks — create todo (todo_add already sends a ping message)
+            for task in &collab_output.delegate {
+                let to = task.to.trim_start_matches('@');
+                if let Err(e) = self.client.todo_add(to, &task.task).await {
+                    self.log_error(&format!("Failed to add todo for @{}: {}", to, e));
                 }
             }
 
-            // Send direct messages to specific teammates
+            // Send direct messages to specific teammates (skip if already delegated to them)
             for dm in &collab_output.messages {
                 let to = dm.to.trim_start_matches('@');
+                if delegated_to.contains(to) {
+                    self.log(&format!("skipped duplicate message to @{} (already delegated)", to));
+                    continue;
+                }
                 if let Err(e) = self.client.add_message(to, &dm.text, None).await {
                     self.log_error(&format!("Failed to message @{}: {}", to, e));
                 }
