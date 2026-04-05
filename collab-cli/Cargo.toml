@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 authors = ["jabberwock"]
 description = "API server for inter-process communication between AI agents."
-license = "AGPL-3.0 + Commons Clause"
+license = "GNU Affero General Public License version 3"
 license-file = "LICENSE"
 
 [[bin]]
