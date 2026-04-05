@@ -4,3 +4,5 @@ members = [
     "collab-server",
 ]
 resolver = "2"
+license = "AGPL-3.0 + Commons Clause"
+license-file = "LICENSE"
