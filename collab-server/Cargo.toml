@@ -1,5 +1,5 @@
 [package]
-name = "collab-server"
+name = "ai-server"
 version = "0.3.0"
 edition = "2021"
 authors = ["jabberwock"]
