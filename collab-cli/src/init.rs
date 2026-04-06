@@ -257,7 +257,7 @@ Your final output must be ONLY a JSON object. Do NOT use `collab send`, `collab 
 - **`response`**: Reply to the sender only if they asked a direct question. Otherwise `null`.
 - **`delegate`**: Assign tasks to teammates. One entry per task. Description must be fully self-contained.
 - **`messages`**: **Always `null`.** Never send status updates, confirmations, or narration.
-- **`completed_tasks`**: Hashes of todos you finished this turn. Otherwise `[]`.
+- **`completed_tasks`**: **REQUIRED when you finish work.** Include the hash of every task you completed this turn. Never leave finished tasks open.
 - **`continue`**: Set `true` to keep working autonomously (multi-step tasks), `false` when done or blocked.
 - **`state_update`**: One-line status only (e.g. `{{"status": "assigned routing task to @d4-web"}}`).
 
@@ -265,7 +265,7 @@ Your final output must be ONLY a JSON object. Do NOT use `collab send`, `collab 
 
 Your pending tasks survive context resets. Check them with `collab todo list` (bash tool).
 
-Mark tasks done with `collab todo done <hash>` before starting the next one.
+**When you finish a task, you MUST include its hash in `completed_tasks` in your JSON output.** Do not leave finished tasks open — they pile up and confuse the team. If you completed multiple tasks in one turn, list all their hashes.
 
 {data_section}## Rules
 
