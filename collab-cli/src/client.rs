@@ -157,6 +157,7 @@ pub struct Todo {
     pub assigned_by: String,
     pub description: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
 }
 

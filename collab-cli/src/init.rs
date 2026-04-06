@@ -115,6 +115,7 @@ pub fn generate(config: &ProjectConfig, output_dir_override: Option<&str>) -> Re
     println!("  ✓  {} (import into dashboard)", cfg_path.display());
 
     println!("\n{} worker environment(s) created.", config.workers.len());
+    println!("\n⚠️  If any workers are already running, restart them to pick up the new server URL ({}).", config.server);
     println!("\nNext steps:");
     println!("  1. Start the collab server:    collab-server");
     println!("  2. Open each worker directory as a Claude Code project");
