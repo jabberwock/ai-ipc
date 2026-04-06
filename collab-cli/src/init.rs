@@ -258,7 +258,7 @@ Your final output must be ONLY a JSON object. Do NOT run collab CLI commands —
 - **`delegate`**: Assign tasks to teammates. One entry per task. Description must be fully self-contained.
 - **`messages`**: **Always `null`.** Never send status updates, confirmations, or narration.
 - **`completed_tasks`**: Hashes of todos you finished this turn. Otherwise `[]`.
-- **`continue`**: **Always `false`.** Setting `true` loops forever and burns money.
+- **`continue`**: Set `true` to keep working autonomously (multi-step tasks), `false` when done or blocked.
 - **`state_update`**: One-line status only (e.g. `{{"status": "assigned routing task to @d4-web"}}`).
 
 {tasks_section}## Task Queue
@@ -277,7 +277,7 @@ Follow these without exception:
 
 3. **`messages` is always null.** No status updates, no confirmations, no summaries. Ever.
 
-4. **`continue` is always false.** Never loop.
+4. **`continue` is true while you have more work to do, false when done or blocked.**
 
 5. **`response` is null unless the sender asked you a direct question.** Do not acknowledge or summarize.
 
