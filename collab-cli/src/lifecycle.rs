@@ -126,6 +126,20 @@ pub fn spawn_worker(
         cmd.process_group(0);
     }
 
+    // Windows: detach from the parent's console so no extra window pops up
+    // and the child doesn't inherit the parent's console handle. Without this
+    // the GUI's "Starting workers" step hung on Windows — `collab start`
+    // couldn't exit because Tauri's sidecar reader was still draining the
+    // parent console that the worker had grabbed a handle on.
+    //
+    //   CREATE_NO_WINDOW          = 0x08000000 — no console window
+    //   CREATE_NEW_PROCESS_GROUP  = 0x00000200 — break from parent's ctrl-C group
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000 | 0x00000200);
+    }
+
     // Detach stdio so the worker (and any grandchildren it spawns) doesn't
     // keep the caller's stdout/stderr pipes open — that's what hung the
     // GUI's "Starting workers" step for minutes on end.
