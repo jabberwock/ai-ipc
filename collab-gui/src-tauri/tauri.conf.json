@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../public",
     "devUrl": "http://localhost:1421",
-    "beforeDevCommand": "pnpm run serve",
-    "beforeBuildCommand": "PROFILE=release ./src-tauri/stage-sidecars.sh"
+    "beforeDevCommand": "node ./src-tauri/stage-sidecars.mjs && pnpm run serve",
+    "beforeBuildCommand": "node ./src-tauri/stage-sidecars.mjs"
   },
   "app": {
     "withGlobalTauri": true,
