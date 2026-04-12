@@ -1,3 +1,4 @@
+#![doc = include_str!("../../README.md")]
 use clap::{Parser, Subcommand};
 use anyhow::Result;
 use serde::Deserialize;
@@ -101,7 +102,7 @@ fn load_dotenv() {
                         let val = val.trim().trim_matches('"').trim_matches('\'');
                         // Don't overwrite values already in the environment
                         if std::env::var(key).is_err() {
-                            std::env::set_var(key, val);
+                            unsafe { std::env::set_var(key, val); }
                         }
                     }
                 }
@@ -813,19 +814,26 @@ async fn lifecycle_status() -> Result<()> {
     Ok(())
 }
 
-fn find_manifest() -> Result<std::path::PathBuf> {
-    // Look for .collab/workers.json in current dir or parents
-    let mut current = std::env::current_dir()?;
+pub fn find_collab_dir_from(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Walk upward from `start` looking for a `.collab/workers.json` manifest.
+    // Returns the `.collab` directory itself.
+    let mut current = start.to_path_buf();
     loop {
-        let manifest = current.join(".collab/workers.json");
-        if manifest.exists() {
-            return Ok(manifest);
+        let collab = current.join(".collab");
+        if collab.join("workers.json").exists() {
+            return Some(collab);
         }
         if !current.pop() {
-            break;
+            return None;
         }
     }
-    Err(anyhow::anyhow!(
-        "Manifest not found. Run 'collab init workers.yml' in your project directory"
-    ))
+}
+
+fn find_manifest() -> Result<std::path::PathBuf> {
+    let cwd = std::env::current_dir()?;
+    find_collab_dir_from(&cwd)
+        .map(|d| d.join("workers.json"))
+        .ok_or_else(|| anyhow::anyhow!(
+            "Manifest not found. Run 'collab init workers.yml' in your project directory"
+        ))
 }

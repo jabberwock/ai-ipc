@@ -1,8 +1,8 @@
 # Hold My Beer
 
-[![CI](https://github.com/jabberwock/hold-my-beer/actions/workflows/rust.yml/badge.svg)](https://github.com/jabberwock/hold-my-beer/actions "GitHub Actions")
+[![CI](https://github.com/HoldMyBeer-gg/hold-my-beer/actions/workflows/rust.yml/badge.svg)](https://github.com/HoldMyBeer-gg/hold-my-beer/actions "GitHub Actions")
 [![License](https://img.shields.io/badge/License-AGPL--3.0%20%2B%20Commons%20Clause-30363D?style=flat&labelColor=1e3a5f)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![YouTube — demo](https://img.shields.io/badge/YouTube-Watch%20demo-FF0000?logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=JJQKMES5zOY)
 
 [Official Website](https://holdmybeer.gg)
@@ -157,7 +157,7 @@ Three agents — one on macOS writing code, one on Linux running tests, one on W
 
 *"Print a TPU case for my iPhone 17 Pro Max when I get home."*
 
-1. **Siri** triggers a shortcut that calls an AI agent via [blend-ai](https://github.com/jabberwock/blend-ai)
+1. **Siri** triggers a shortcut that calls an AI agent via [blend-ai](https://github.com/HoldMyBeer-gg/blend-ai)
 2. **The agent** looks up dimensions, finds the STL, slices for TPU
 3. **The agent** sends the print job via MCP to your Bambu Lab printer
 4. **collab** signals back: *"Print queued, ~3h 20m, bed heating now"*

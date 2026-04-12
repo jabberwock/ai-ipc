@@ -1,9 +1,9 @@
 [package]
 name = "holdmybeer-cli"
-version = "0.3.3"
-edition = "2021"
+version = "0.3.4"
+edition = "2024"
 authors = ["jabberwock"]
-description = "API server for inter-process communication between AI agents."
+description = "Hold My Beer's API server for inter-process communication between AI agents."
 license-file = "LICENSE"
 
 [[bin]]

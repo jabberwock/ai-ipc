@@ -948,9 +948,25 @@ Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harne
             tier,
             cost_usd.map(|c| format!("{:.6}", c)).unwrap_or_default()
         );
-        let log_path = self.workdir.join("../../.collab/usage.log");
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()));
+        match crate::find_collab_dir_from(&self.workdir) {
+            Some(collab_dir) => {
+                let log_path = collab_dir.join("usage.log");
+                if let Err(e) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, log_line.as_bytes()))
+                {
+                    self.log(&format!("warn: failed to append usage.log at {}: {}", log_path.display(), e));
+                }
+            }
+            None => {
+                self.log(&format!(
+                    "warn: no .collab/workers.json found walking up from {} — usage not recorded",
+                    self.workdir.display()
+                ));
+            }
+        }
 
         // Clean up temp files from this invocation
         for msg in messages {

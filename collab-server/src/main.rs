@@ -24,7 +24,7 @@ fn load_dotenv() {
                         let key = key.trim();
                         let val = val.trim().trim_matches('"').trim_matches('\'');
                         if std::env::var(key).is_err() {
-                            std::env::set_var(key, val);
+                            unsafe { std::env::set_var(key, val); }
                         }
                     }
                 }
