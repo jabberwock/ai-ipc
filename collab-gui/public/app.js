@@ -37,6 +37,7 @@ let todosTimer  = null;
 let serverPollTimer = null;
 let presenceTimer = null;
 let dashboardActive = false;
+let wizardFromDashboard = false;
 
 // Message state
 let allMessages = [];      // [{id,sender,recipient,content,timestamp,hash}]
@@ -124,6 +125,40 @@ function goStep(n) {
     const s = i + 1;
     d.className = 'wiz-dot ' + (s < n ? 'done' : s === n ? 'active' : '');
   });
+}
+
+function updateWizardStep1Nav() {
+  const step1Nav = document.querySelector('#step-1 .step-nav');
+  if (!step1Nav) return;
+
+  // Clear existing back button if any
+  const existingBack = step1Nav.querySelector('#back-from-step1');
+  if (existingBack) existingBack.remove();
+
+  // Add back button if coming from dashboard
+  if (wizardFromDashboard) {
+    const backBtn = document.createElement('button');
+    backBtn.className = 'btn btn-ghost';
+    backBtn.textContent = '← Back';
+    backBtn.id = 'back-from-step1';
+    backBtn.addEventListener('click', backFromWizard);
+    step1Nav.insertBefore(backBtn, step1Nav.firstChild);
+  }
+}
+
+function backFromWizard() {
+  if (wizardFromDashboard) {
+    wizardFromDashboard = false;
+    dashboardActive = true;
+    const wiz  = document.getElementById('wizard');
+    const dash = document.getElementById('dashboard');
+    wiz.classList.add('exiting');
+    setTimeout(() => {
+      wiz.hidden = true;
+      dash.hidden = false;
+      dash.classList.add('visible');
+    }, 350);
+  }
 }
 
 
@@ -521,7 +556,10 @@ async function doLaunch() {
   // Save config
   cfg.setupComplete = true;
   try {
-    await invoke('save_config', { config: cfg });
+    // Exclude the token from the on-disk config — require re-entry on next launch
+    // rather than storing a credential in plaintext in ~/.collab.toml.
+    const { token: _t, ...cfgWithoutToken } = cfg;
+    await invoke('save_config', { config: cfgWithoutToken });
   } catch (e) { /* non-fatal */ }
 
   document.getElementById('open-dash-btn').hidden = false;
@@ -608,6 +646,7 @@ function toDashboard() {
 }
 
 function goToWizard() {
+  wizardFromDashboard = dashboardActive;
   dashboardActive = false;
   const wiz  = document.getElementById('wizard');
   const dash = document.getElementById('dashboard');
@@ -619,6 +658,7 @@ function goToWizard() {
     teardownDashboard();
     prefillWizard();
     goStep(1);
+    updateWizardStep1Nav();
   }, 350);
 }
 
@@ -663,42 +703,63 @@ function teardownDashboard() {
   usageOpen = false;
   const usagePanel = document.getElementById('usage-panel');
   if (usagePanel) usagePanel.classList.remove('open');
-  if (sseConn) { sseConn.close(); sseConn = null; }
+  if (sseConn) { sseConn.abort(); sseConn = null; }
   const textEl = document.getElementById('compose-text');
   if (textEl) textEl.removeEventListener('keydown', onComposeKeydown);
 }
 
 // ── SSE connection ────────────────────────────────────────────────────────────
-function connectSSE() {
-  if (sseConn) sseConn.close();
+// Uses fetch + ReadableStream instead of EventSource so the bearer token is
+// sent in an Authorization header rather than as a URL query parameter.
+async function connectSSE() {
+  if (sseConn) { sseConn.abort(); sseConn = null; }
 
-  const url = `${cfg.serverUrl}/events?token=${encodeURIComponent(cfg.token)}`;
+  const controller = new AbortController();
+  sseConn = controller;
+
   try {
-    sseConn = new EventSource(url);
+    const res = await fetch(`${cfg.serverUrl}/events`, {
+      headers: { Authorization: `Bearer ${cfg.token}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    sseRetries = 0;
+    setConnStatus(true);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE messages are separated by blank lines; split on \n\n
+      const parts = buf.split('\n\n');
+      buf = parts.pop(); // keep any incomplete trailing chunk
+      for (const block of parts) {
+        for (const line of block.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try {
+              const msg = JSON.parse(line.slice(6));
+              onNewMessage(msg);
+            } catch (_) {}
+          }
+        }
+      }
+    }
   } catch (e) {
+    if (e.name === 'AbortError') return; // intentional teardown
     setConnStatus(false);
+    sseConn = null;
     scheduleSSEReconnect();
     return;
   }
-
-  sseConn.onopen = () => {
-    sseRetries = 0;
-    setConnStatus(true);
-  };
-
-  sseConn.onmessage = e => {
-    try {
-      const msg = JSON.parse(e.data);
-      onNewMessage(msg);
-    } catch (_) {}
-  };
-
-  sseConn.onerror = () => {
-    setConnStatus(false);
-    sseConn.close();
-    sseConn = null;
-    scheduleSSEReconnect();
-  };
+  // Stream ended cleanly — server closed the connection.
+  setConnStatus(false);
+  sseConn = null;
+  scheduleSSEReconnect();
 }
 
 function scheduleSSEReconnect() {
@@ -821,14 +882,30 @@ function renderRoster(workers) {
 
 // ── Todos ─────────────────────────────────────────────────────────────────────
 async function fetchTodos() {
-  if (!cfg.identity) return;
+  if (!cfg.token) return;
+  // Gather all worker ids known to us (live roster + wizard config).
+  const seen = new Set();
+  knownWorkers.forEach(w => seen.add(w.instance_id));
+  workers.forEach(w => { if (w.name) seen.add(w.name); });
+  // Fall back to own identity if nothing else is known yet.
+  if (seen.size === 0 && cfg.identity) seen.add(cfg.identity.replace(/^@/, ''));
+  if (seen.size === 0) return;
+
   try {
-    const res = await fetch(`${cfg.serverUrl}/todos/${cfg.identity}`, {
-      headers: { Authorization: `Bearer ${cfg.token}` },
-    });
-    if (!res.ok) return;
-    const todos = await res.json();
-    renderTodos(todos);
+    const allTodos = [];
+    await Promise.all([...seen].map(async id => {
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return;
+      try {
+        const res = await fetch(`${cfg.serverUrl}/todos/${id}`, {
+          headers: { Authorization: `Bearer ${cfg.token}` },
+        });
+        if (!res.ok) return;
+        const todos = await res.json();
+        allTodos.push(...todos);
+      } catch (_) {}
+    }));
+    allTodos.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    renderTodos(allTodos);
   } catch (_) {}
 }
 
@@ -848,10 +925,21 @@ function renderTodos(todos) {
   todos.forEach(t => {
     const div = document.createElement('div');
     div.className = 'todo-item';
-    div.innerHTML = `
-      <div class="todo-by">from ${esc(t.assigned_by)} · ${timeAgo(t.created_at)}</div>
-      <div class="todo-desc">${esc(t.description)}</div>
-    `;
+
+    const byLine = document.createElement('div');
+    byLine.className = 'todo-by';
+    const assignee = document.createElement('span');
+    assignee.className = 'todo-assignee';
+    assignee.textContent = '@' + (t.instance || '');
+    byLine.appendChild(assignee);
+    byLine.appendChild(document.createTextNode(' · from ' + (t.assigned_by || '') + ' · ' + timeAgo(t.created_at)));
+    div.appendChild(byLine);
+
+    const descLine = document.createElement('div');
+    descLine.className = 'todo-desc';
+    descLine.textContent = t.description || '';
+    div.appendChild(descLine);
+
     list.appendChild(div);
   });
 }
@@ -901,6 +989,15 @@ async function doAddTodo() {
   const description = desc.value.trim();
   if (!instance) { toast('Choose a worker to assign the task to', true); return; }
   if (!description) { toast('Enter a task description', true); return; }
+  if (description.length > 500) { toast('Task description must be 500 characters or fewer', true); return; }
+  // Validate that the selected worker is known (prevent arbitrary instance injection).
+  const validWorkerIds = new Set([
+    ...knownWorkers.map(w => w.instance_id),
+    ...workers.map(w => w.name).filter(Boolean),
+  ]);
+  if (validWorkerIds.size > 0 && !validWorkerIds.has(instance)) {
+    toast('Unknown worker: ' + instance, true); return;
+  }
   const assignedBy = cfg.identity || 'gui';
   try {
     const res = await fetch(`${cfg.serverUrl}/todos`, {
@@ -963,15 +1060,37 @@ function buildMessageEl(msg, isNew) {
   const colorIdx = getColor(msg.sender);
   const div = document.createElement('div');
   div.className = 'msg' + (isNew ? ' is-new' : '');
-  div.innerHTML = `
-    <span class="msg-badge badge-${colorIdx}">${esc(msg.sender)}</span>
-    <div class="msg-meta">
-      <span class="msg-sender c${colorIdx}">${esc(msg.sender)}</span>
-      ${msg.recipient && msg.recipient !== 'all' ? `<span class="msg-to">→ ${esc(msg.recipient)}</span>` : '<span class="msg-to">→ all</span>'}
-      <span class="msg-time">${fmtTime(msg.timestamp)}</span>
-    </div>
-    <div class="msg-body">${esc(msg.content)}</div>
-  `;
+
+  const badge = document.createElement('span');
+  badge.className = `msg-badge badge-${colorIdx}`;
+  badge.textContent = msg.sender || '';
+  div.appendChild(badge);
+
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+
+  const senderSpan = document.createElement('span');
+  senderSpan.className = `msg-sender c${colorIdx}`;
+  senderSpan.textContent = msg.sender || '';
+  meta.appendChild(senderSpan);
+
+  const toSpan = document.createElement('span');
+  toSpan.className = 'msg-to';
+  toSpan.textContent = (msg.recipient && msg.recipient !== 'all') ? `→ ${msg.recipient}` : '→ all';
+  meta.appendChild(toSpan);
+
+  const timeSpan = document.createElement('span');
+  timeSpan.className = 'msg-time';
+  timeSpan.textContent = fmtTime(msg.timestamp);
+  meta.appendChild(timeSpan);
+
+  div.appendChild(meta);
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  body.textContent = msg.content || '';
+  div.appendChild(body);
+
   return div;
 }
 
@@ -1304,8 +1423,14 @@ async function doSendMessage() {
   if (mentionMatch) {
     recipient = mentionMatch[1];
     content = mentionMatch[2];
+    // Validate recipient against known workers (allow 'all' and own identity).
+    const knownIds = new Set(['all', cfg.identity || '', ...knownWorkers.map(w => w.instance_id), ...workers.map(w => w.name).filter(Boolean)]);
+    if (!knownIds.has(recipient)) {
+      toast(`Unknown recipient: @${recipient}`, true); return;
+    }
   }
   if (!content) return;
+  if (content.length > 4000) { toast('Message must be 4000 characters or fewer', true); return; }
 
   try {
     const res = await fetch(`${cfg.serverUrl}/messages`, {
@@ -1629,11 +1754,11 @@ document.getElementById('todos-panel').classList.add('collapsed');
 // ── Test hooks ───────────────────────────────────────────────────────────────
 // Playwright tests need to read/write wizard state and call internal
 // functions, but `let cfg` / `let workers` don't attach to window in a
-// classic <script>. Expose a small bridge instead of converting declarations
-// to `var`. Safe to ship — it only reads/writes state that already exists.
+// classic <script>. Expose a minimal bridge — token is intentionally excluded
+// from the getter to avoid leaking credentials via window inspection.
 window.__wizard = {
-  get cfg()        { return cfg; },
-  set cfg(v)       { Object.assign(cfg, v); },
+  get cfg()        { const { token: _t, ...safe } = cfg; return safe; },
+  set cfg(v)       { const { token: _t, ...rest } = v; Object.assign(cfg, rest); },
   get workers()    { return workers; },
   set workers(v)   { workers = v; },
   parseWorkersYaml,
