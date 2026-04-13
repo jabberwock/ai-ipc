@@ -157,6 +157,7 @@ pub fn run() {
             commands::path_exists,
             commands::home_dir,
             commands::start_server,
+            commands::mark_session_active,
             commands::stop_server,
             commands::server_running,
             commands::run_command,

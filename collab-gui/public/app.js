@@ -508,6 +508,12 @@ async function doLaunch() {
     if (probe.status === 200) {
       serverAlreadyRunning = true;
       appendLaunchLog('✓ Found existing server at ' + cfg.serverUrl + ' — skipping local spawn', false);
+      // Register the session anyway so Cmd+Q / close-window warns about
+      // the local worker daemons this GUI is about to start, even though
+      // we skipped start_server (which normally records this).
+      try {
+        await invoke('mark_session_active', { projectDir: cfg.projectDir });
+      } catch (e) { /* non-fatal */ }
       setLaunchItem('li-server', 'done');
     } else if (probe.status === 401) {
       setLaunchItem('li-server', 'error', 'token rejected (401)');

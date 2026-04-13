@@ -116,7 +116,10 @@ pub async fn start_server(
     };
 
     // Remember where we're running so the window-close handler knows where
-    // to run `collab stop all` on shutdown.
+    // to run `collab stop all` on shutdown. See also `mark_session_active`,
+    // which is called from the launch flow when we probe an existing server
+    // and skip the local spawn — the dir still needs to be remembered so
+    // Cmd+Q still warns the user about local worker processes.
     {
         let mut dir_guard = state.current_project_dir.lock().await;
         *dir_guard = Some(cwd.clone());
@@ -156,6 +159,29 @@ pub async fn start_server(
 
     let mut guard = state.server_process.lock().await;
     *guard = Some(child);
+    Ok(())
+}
+
+/// Register an active session without spawning a local collab-server.
+///
+/// Called from the GUI launch flow when we probe an existing server at
+/// `cfg.serverUrl` and skip the local spawn (e.g. a mac joiner connecting
+/// to a Windows host). The project dir still needs to be remembered so
+/// `handle_quit_attempt` can show the "stop workers before quitting?"
+/// warning and `shutdown_session` can run `collab stop all` on the
+/// local worker daemons this GUI manages.
+#[tauri::command]
+pub async fn mark_session_active(
+    state: tauri::State<'_, AppState>,
+    project_dir: String,
+) -> Result<(), String> {
+    let cwd = if project_dir.is_empty() {
+        std::env::current_dir().map_err(|e| e.to_string())?
+    } else {
+        PathBuf::from(&project_dir)
+    };
+    let mut guard = state.current_project_dir.lock().await;
+    *guard = Some(cwd);
     Ok(())
 }
 
