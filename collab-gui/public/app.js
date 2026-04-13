@@ -492,24 +492,53 @@ async function doLaunch() {
     }
   }
 
-  // Step 2: Start collab-server
+  // Step 2: Start collab-server — unless one is already reachable at the
+  // configured URL. A reachable server means the user is joining an existing
+  // team (e.g. a mac worker connecting to a Windows host over Tailscale) or
+  // simply re-launching against a server that's already up. Either way,
+  // spawning a new one on top would fight for the port and break auth.
   setLaunchItem('li-server', 'running');
-  appendLaunchLog('Starting collab-server on ' + cfg.serverUrl, false);
+  let serverAlreadyRunning = false;
   try {
-    await invoke('start_server', {
-      serverUrl:  cfg.serverUrl,
-      token:      cfg.token,
-      projectDir: cfg.projectDir,
+    const probeUrl = cfg.serverUrl.replace(/\/+$/, '') + '/';
+    const probe = await fetch(probeUrl, {
+      headers: { Authorization: `Bearer ${cfg.token}` },
+      signal: AbortSignal.timeout(2500),
     });
-    // Give the server a moment to start
-    await sleep(1200);
-    setLaunchItem('li-server', 'done');
-    appendLaunchLog('✓ Server started', false);
+    if (probe.status === 200) {
+      serverAlreadyRunning = true;
+      appendLaunchLog('✓ Found existing server at ' + cfg.serverUrl + ' — skipping local spawn', false);
+      setLaunchItem('li-server', 'done');
+    } else if (probe.status === 401) {
+      setLaunchItem('li-server', 'error', 'token rejected (401)');
+      appendLaunchLog('✗ Server at ' + cfg.serverUrl + ' rejected the token (401). Check that COLLAB_TOKEN matches what the server was started with.', true);
+      resetLaunchBtn();
+      return;
+    }
+    // Any other status (5xx, unexpected) → fall through and try to spawn locally.
   } catch (e) {
-    setLaunchItem('li-server', 'error', e);
-    appendLaunchLog('✗ ' + e, true);
-    resetLaunchBtn();
-    return;
+    // Connect refused / DNS failure / timeout → no server reachable, we'll spawn one.
+    appendLaunchLog('• No server reachable at ' + cfg.serverUrl + ' — will start one locally', false);
+  }
+
+  if (!serverAlreadyRunning) {
+    appendLaunchLog('Starting collab-server on ' + cfg.serverUrl, false);
+    try {
+      await invoke('start_server', {
+        serverUrl:  cfg.serverUrl,
+        token:      cfg.token,
+        projectDir: cfg.projectDir,
+      });
+      // Give the server a moment to start
+      await sleep(1200);
+      setLaunchItem('li-server', 'done');
+      appendLaunchLog('✓ Server started', false);
+    } catch (e) {
+      setLaunchItem('li-server', 'error', e);
+      appendLaunchLog('✗ ' + e, true);
+      resetLaunchBtn();
+      return;
+    }
   }
 
   // Step 3: collab init
