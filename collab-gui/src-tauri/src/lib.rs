@@ -32,7 +32,14 @@ impl Default for AppState {
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct SavedConfig {
+    // JS sends camelCase (`serverUrl`, `projectDir`, `setupComplete`, …)
+    // and Tauri only auto-converts top-level invoke args, not nested struct
+    // fields. Without `rename_all = "camelCase"` here, serde silently dropped
+    // every field whose JS name didn't match the Rust field name and reset it
+    // to its default on every save — which is why the config file stayed stuck
+    // on its defaults no matter what the wizard did.
     #[serde(default)]
     pub token: String,
     #[serde(default = "default_server_url")]
