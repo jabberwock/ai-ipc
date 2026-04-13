@@ -262,9 +262,10 @@
           <input id="compose-to" class="inp" type="text" value="all" title="Recipient name or 'all' to broadcast">
         </div>
         <div class="compose-row">
-          <textarea id="compose-text" class="inp" placeholder="Type a message… (Shift+Enter to send, / for commands)" rows="2"></textarea>
+          <textarea id="compose-text" class="inp" placeholder="Type a message… (Enter to send · Shift+Enter for newline · / for commands · @ to mention)" rows="2"></textarea>
           <button class="btn btn-primary u-self-end" id="btn-send">Send</button>
           <ul id="slash-list" hidden role="listbox" aria-label="Command suggestions"></ul>
+          <ul id="mention-list" hidden role="listbox" aria-label="Worker mentions"></ul>
         </div>
       </div>
     </div>
@@ -274,6 +275,15 @@
       <div class="todos-header">
         Todos
         <span class="todos-count" id="todos-count">0</span>
+        <div class="feed-spacer"></div>
+        <button class="btn btn-ghost btn-xs" id="btn-todo-toggle-form" title="Add a task">+</button>
+      </div>
+      <div class="todo-compose" id="todo-compose" hidden>
+        <select id="todo-assign-to" class="inp inp-sm" title="Assign to worker">
+          <option value="">Assign to…</option>
+        </select>
+        <textarea id="todo-desc" class="inp inp-sm" placeholder="Task description…" rows="2"></textarea>
+        <button class="btn btn-primary btn-sm u-full-w" id="btn-add-todo">+ Add Task</button>
       </div>
       <div class="todos-list" id="todos-list" aria-live="polite" aria-label="Task list">
         <div class="todos-empty">No pending tasks</div>

@@ -48,6 +48,7 @@ let todosVisible  = false;
 let serverLogOpen = false;
 let usageOpen     = false;
 let usageTimer    = null;
+let knownWorkers  = [];   // [{instance_id, role}] — updated when roster fetched
 
 const CLI_TEMPLATES = {
   claude:  'claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit',
@@ -764,6 +765,12 @@ async function fetchRoster() {
 }
 
 function renderRoster(workers) {
+  // Keep a global list of known workers for autocomplete / todo assignment.
+  if (workers && workers.length) {
+    knownWorkers = workers.map(w => ({ instance_id: w.instance_id, role: w.role || '' }));
+    updateTodoWorkerSelect();
+  }
+
   const list = document.getElementById('roster-list');
   if (!list) return;
   list.innerHTML = '';
@@ -847,6 +854,76 @@ function renderTodos(todos) {
     `;
     list.appendChild(div);
   });
+}
+
+function updateTodoWorkerSelect() {
+  const sel = document.getElementById('todo-assign-to');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">Assign to…</option>';
+
+  // Build a merged list: live roster first, then wizard-configured workers as
+  // fallback so the dropdown works before the server is running.
+  const seen = new Set();
+  const entries = [];
+  knownWorkers.forEach(w => {
+    if (!seen.has(w.instance_id)) { seen.add(w.instance_id); entries.push({ id: w.instance_id, role: w.role }); }
+  });
+  workers.forEach(w => {
+    if (w.name && !seen.has(w.name)) { seen.add(w.name); entries.push({ id: w.name, role: w.role || '' }); }
+  });
+
+  entries.forEach(({ id, role }) => {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = id + (role ? ` — ${role}` : '');
+    sel.appendChild(opt);
+  });
+  if (prev) sel.value = prev;
+}
+
+function toggleTodoForm() {
+  const form = document.getElementById('todo-compose');
+  if (!form) return;
+  form.hidden = !form.hidden;
+  if (!form.hidden) {
+    updateTodoWorkerSelect();
+    const desc = document.getElementById('todo-desc');
+    if (desc) desc.focus();
+  }
+}
+
+async function doAddTodo() {
+  const sel  = document.getElementById('todo-assign-to');
+  const desc = document.getElementById('todo-desc');
+  if (!sel || !desc) return;
+  const instance = sel.value.trim();
+  const description = desc.value.trim();
+  if (!instance) { toast('Choose a worker to assign the task to', true); return; }
+  if (!description) { toast('Enter a task description', true); return; }
+  const assignedBy = cfg.identity || 'gui';
+  try {
+    const res = await fetch(`${cfg.serverUrl}/todos`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization:  `Bearer ${cfg.token}`,
+      },
+      body: JSON.stringify({ assigned_by: assignedBy, instance, description }),
+    });
+    if (res.ok) {
+      desc.value = '';
+      sel.value = '';
+      const form = document.getElementById('todo-compose');
+      if (form) form.hidden = true;
+      toast(`Task assigned to @${instance}`);
+      fetchTodos();
+    } else {
+      toast('Failed to add task: ' + res.status, true);
+    }
+  } catch (e) {
+    toast('Error adding task: ' + e, true);
+  }
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -937,6 +1014,72 @@ function updateMentionBadge() {
 }
 
 // ── Compose ───────────────────────────────────────────────────────────────────
+// ── @ Mention autocomplete ────────────────────────────────────────────────────
+let mentionMatches = [];
+let mentionIdx     = 0;
+// Cursor position within the word being completed (start of @token in textarea)
+let mentionStart   = -1;
+
+function getWorkerNames() {
+  // Live roster first; fall back to wizard-configured workers so autocomplete
+  // works even before the server is running.
+  const seen = new Set(['all']);
+  knownWorkers.forEach(w => seen.add(w.instance_id));
+  workers.forEach(w => { if (w.name) seen.add(w.name); });
+  return [...seen];
+}
+
+function renderMentionList() {
+  const list = document.getElementById('mention-list');
+  if (!list) return;
+  if (!mentionMatches.length) { list.hidden = true; list.innerHTML = ''; return; }
+  list.hidden = false;
+  list.innerHTML = '';
+  mentionMatches.forEach((name, i) => {
+    const li = document.createElement('li');
+    li.className = 'slash-item' + (i === mentionIdx ? ' selected' : '');
+    li.setAttribute('role', 'option');
+    if (i === mentionIdx) li.setAttribute('aria-selected', 'true');
+    li.dataset.name = name;
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'slash-cmd';
+    nameSpan.textContent = '@' + name;
+    li.appendChild(nameSpan);
+    const w = knownWorkers.find(w => w.instance_id === name);
+    if (w && w.role) {
+      const roleSpan = document.createElement('span');
+      roleSpan.className = 'slash-desc';
+      roleSpan.textContent = w.role;
+      li.appendChild(roleSpan);
+    }
+    list.appendChild(li);
+  });
+}
+
+function closeMentionList() {
+  mentionMatches = [];
+  mentionIdx = 0;
+  mentionStart = -1;
+  const list = document.getElementById('mention-list');
+  if (list) { list.hidden = true; list.innerHTML = ''; }
+}
+
+function applyMention(name) {
+  const input = document.getElementById('compose-text');
+  if (!input || mentionStart < 0) return;
+  const val = input.value;
+  // Find where the current @word ends
+  let end = mentionStart + 1;
+  while (end < val.length && /\S/.test(val[end])) end++;
+  const before = val.slice(0, mentionStart);
+  const after  = val.slice(end);
+  input.value = before + '@' + name + ' ' + after;
+  const pos = mentionStart + name.length + 2; // after '@name '
+  input.setSelectionRange(pos, pos);
+  closeMentionList();
+  input.focus();
+}
+
 // ── Slash commands ────────────────────────────────────────────────────────────
 const SLASH_CMDS = [
   { cmd: 'r',   desc: 'Reply to last sender',  hint: '/r [text]'            },
@@ -1047,9 +1190,11 @@ function onComposeInput() {
   const input = document.getElementById('compose-text');
   if (!input) return;
   const val = input.value;
+  const cursor = input.selectionStart;
 
   // Show palette while typing `/cmd` with no space yet.
   if (val.startsWith('/') && !val.includes(' ')) {
+    closeMentionList();
     const q = val.slice(1).toLowerCase();
     slashMatches = SLASH_CMDS.filter(c => c.cmd.startsWith(q));
     slashIdx = 0;
@@ -1062,9 +1207,50 @@ function onComposeInput() {
   if (val === '/r ')   { applySlash('r');   return; }
   if (val === '/all ') { applySlash('all'); return; }
   if (val === '/w ')   { applySlash('w');   return; }
+
+  // @ mention autocomplete: find the @word that the cursor is inside.
+  let atPos = -1;
+  for (let i = cursor - 1; i >= 0; i--) {
+    if (val[i] === '@') { atPos = i; break; }
+    if (/\s/.test(val[i])) break;
+  }
+  if (atPos >= 0) {
+    const query = val.slice(atPos + 1, cursor).toLowerCase();
+    const names = getWorkerNames();
+    mentionMatches = names.filter(n => n.toLowerCase().startsWith(query));
+    if (mentionMatches.length) {
+      mentionStart = atPos;
+      mentionIdx = 0;
+      renderMentionList();
+      return;
+    }
+  }
+  closeMentionList();
 }
 
 function onComposeKeydown(e) {
+  // Mention palette navigation
+  if (mentionMatches.length) {
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault();
+      applyMention(mentionMatches[mentionIdx]);
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      mentionIdx = (mentionIdx + 1) % mentionMatches.length;
+      renderMentionList();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      mentionIdx = (mentionIdx - 1 + mentionMatches.length) % mentionMatches.length;
+      renderMentionList();
+      return;
+    }
+    if (e.key === 'Escape') { closeMentionList(); return; }
+  }
+
   // Slash palette navigation
   if (slashMatches.length) {
     if (e.key === 'Enter' || e.key === 'Tab') {
@@ -1299,11 +1485,11 @@ function renderUsage(rows, _rawText) {
     totalDur  += r.duration;
   }
   if (totalEl) {
+    const costStr = totalCost > 0 ? ` · $${totalCost.toFixed(4)}` : '';
     totalEl.textContent =
       `${rows.length} call${rows.length !== 1 ? 's' : ''} · ` +
       `${fmtTokens(totalIn + totalOut)} toks · ` +
-      `${fmtDuration(totalDur)} · ` +
-      (totalCost > 0 ? `$${totalCost.toFixed(4)}` : 'no cost data');
+      `${fmtDuration(totalDur)}${costStr}`;
   }
 
   // Newest last so the viewport scrolls to the latest entry naturally.
@@ -1339,6 +1525,34 @@ function renderUsage(rows, _rawText) {
 
     inner.appendChild(row);
   });
+
+  // Per-worker summary footer
+  const workerMap = {};
+  for (const r of rows) {
+    if (!workerMap[r.worker]) workerMap[r.worker] = { inTok: 0, outTok: 0, cost: 0, duration: 0, calls: 0 };
+    workerMap[r.worker].inTok    += r.inTok;
+    workerMap[r.worker].outTok   += r.outTok;
+    workerMap[r.worker].cost     += r.cost;
+    workerMap[r.worker].duration += r.duration;
+    workerMap[r.worker].calls++;
+  }
+  const workerNames = Object.keys(workerMap);
+  if (workerNames.length > 1 || rows.length > 0) {
+    const sep = document.createElement('div');
+    sep.className = 'usage-sep';
+    inner.appendChild(sep);
+
+    const totalRow = document.createElement('div');
+    totalRow.className = 'usage-row usage-totals-row';
+    totalRow.innerHTML =
+      `<span class="usage-time" style="color:var(--dim-text)">TOTAL</span>` +
+      `<span class="usage-worker" style="color:var(--dim-text)">${rows.length} call${rows.length !== 1 ? 's' : ''}</span>` +
+      `<span class="usage-toks">${fmtTokens(totalIn)} in · ${fmtTokens(totalOut)} out</span>` +
+      `<span class="usage-dur">${fmtDuration(totalDur)}</span>` +
+      `<span class="usage-cost${totalCost > 0 ? '' : ' zero'}">${totalCost > 0 ? '$' + totalCost.toFixed(4) : '—'}</span>`;
+    inner.appendChild(totalRow);
+  }
+
   inner.scrollTop = inner.scrollHeight;
 }
 
@@ -1443,6 +1657,19 @@ window.__wizard = {
     if (el) el.addEventListener(ev, fn);
   };
 
+  // Block webview reload shortcuts — F5, Ctrl+R, Ctrl+Shift+R, Cmd+R.
+  // A reload wipes in-memory GUI state but Rust-side worker handles survive,
+  // which leaves the user with zombie workers and no UI to manage them.
+  window.addEventListener('keydown', (e) => {
+    const isReloadKey =
+      e.key === 'F5' ||
+      ((e.ctrlKey || e.metaKey) && (e.key === 'r' || e.key === 'R'));
+    if (isReloadKey) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+
   // Wizard — step navigation + actions
   on('btn-gen-token',   'click', doGenerateToken);
   on('btn-step1-next',  'click', step1Next);
@@ -1494,7 +1721,26 @@ window.__wizard = {
   if (textEl) {
     textEl.addEventListener('blur', () => {
       // Delay so mousedown on a palette item can fire first.
-      setTimeout(closeSlashList, 150);
+      setTimeout(() => { closeSlashList(); closeMentionList(); }, 150);
+    });
+  }
+
+  // Mention list click
+  const mentionListEl = document.getElementById('mention-list');
+  if (mentionListEl) {
+    mentionListEl.addEventListener('mousedown', e => {
+      const item = e.target.closest('.slash-item');
+      if (item) { e.preventDefault(); applyMention(item.dataset.name); }
+    });
+  }
+
+  // Todo form toggle + submit
+  on('btn-todo-toggle-form', 'click', toggleTodoForm);
+  on('btn-add-todo',         'click', doAddTodo);
+  const todoDesc = document.getElementById('todo-desc');
+  if (todoDesc) {
+    todoDesc.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doAddTodo(); }
     });
   }
 })();

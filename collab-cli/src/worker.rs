@@ -861,14 +861,26 @@ Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harne
                 }
             }
 
-            // Send direct messages to specific teammates (skip if already delegated to them)
+            // Send direct messages to specific teammates. Skip recipients that
+            // already received a `response` or a `delegate` in this turn — the
+            // model often duplicates the same content across fields, especially
+            // on cheaper tiers that ignore the "messages must be null" rule.
+            let mut messaged: std::collections::HashSet<String> = std::collections::HashSet::new();
             for dm in &collab_output.messages {
-                let to = dm.to.trim_start_matches('@');
-                if delegated_to.contains(to) {
+                let to = dm.to.trim_start_matches('@').to_string();
+                if delegated_to.contains(&to) {
                     self.log(&format!("skipped duplicate message to @{} (already delegated)", to));
                     continue;
                 }
-                if let Err(e) = self.client.add_message(to, &dm.text, None).await {
+                if replied.contains(&to) {
+                    self.log(&format!("skipped duplicate message to @{} (already in response)", to));
+                    continue;
+                }
+                if !messaged.insert(to.clone()) {
+                    self.log(&format!("skipped duplicate message to @{} (already messaged this turn)", to));
+                    continue;
+                }
+                if let Err(e) = self.client.add_message(&to, &dm.text, None).await {
                     self.log_error(&format!("Failed to message @{}: {}", to, e));
                 }
             }
@@ -882,23 +894,35 @@ Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harne
                     collab_output.completed_tasks.len(), max_completions, max_completions
                 ));
             }
+            let mut completed_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for hash in collab_output.completed_tasks.iter().take(max_completions) {
                 let hash_clean = hash.trim();
                 if hash_clean.is_empty() { continue; }
+                if !completed_seen.insert(hash_clean.to_string()) {
+                    self.log(&format!("skipped duplicate completion for {}", hash_clean));
+                    continue;
+                }
                 match self.client.todo_done(hash_clean).await {
                     Ok(_) => self.log(&format!("task {} marked done", hash_clean)),
                     Err(e) => self.log_error(&format!("Failed to mark task {} done: {}", hash_clean, e)),
                 }
             }
 
-            // Pipeline: auto-dispatch to downstream workers (skip those already replied to)
+            // Pipeline: auto-dispatch to downstream workers. Skip any that
+            // already received a message this turn via response/delegate/messages.
             if !collab_output.completed_tasks.is_empty() && !self.hands_off_to.is_empty() {
                 let summary = collab_output.response.as_deref().unwrap_or("Task completed.");
                 let handoff_msg = format!("Completed work from @{}: {}", self.instance_id, summary);
                 for downstream in &self.hands_off_to {
-                    let to = downstream.trim_start_matches('@');
-                    if replied.contains(to) { continue; }
-                    if let Err(e) = self.client.add_message(to, &handoff_msg, None).await {
+                    let to = downstream.trim_start_matches('@').to_string();
+                    if replied.contains(&to)
+                        || delegated_to.contains(&to)
+                        || messaged.contains(&to)
+                    {
+                        self.log(&format!("skipped pipeline → @{} (already contacted this turn)", to));
+                        continue;
+                    }
+                    if let Err(e) = self.client.add_message(&to, &handoff_msg, None).await {
                         self.log_error(&format!("Failed to route to @{}: {}", to, e));
                     } else {
                         self.log(&format!("pipeline → @{}", to));

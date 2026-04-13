@@ -1,3 +1,5 @@
+killall.ps1
+killall.sh
 integration_test.log
 .env
 .planning
