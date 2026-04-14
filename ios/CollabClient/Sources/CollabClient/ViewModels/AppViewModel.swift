@@ -63,6 +63,8 @@ final class AppViewModel: ObservableObject {
     // MARK: - Dashboard lifecycle
 
     func startDashboard() {
+        // Idempotent: cancel any in-flight tasks before restarting
+        stopDashboard()
         loadInitialMessages()
         sseService.connect()
         startPolling()
@@ -104,18 +106,18 @@ final class AppViewModel: ObservableObject {
     // MARK: - Data loading
 
     private func loadInitialMessages() {
-        Task {
-            do {
-                let history = try await api.fetchHistory(for: config.identity, limit: 200)
-                // Also fetch all broadcast messages
-                let allHistory = try await api.fetchHistory(for: "all", limit: 200)
-                let combined = (history + allHistory)
-                    .sorted { $0.date < $1.date }
-                var seen = Set<String>()
-                messages = combined.filter { seen.insert($0.id).inserted }
-            } catch {
-                showError(error.localizedDescription)
-            }
+        Task { await refreshMessages() }
+    }
+
+    func refreshMessages() async {
+        do {
+            let history = try await api.fetchHistory(for: config.identity, limit: 200)
+            let allHistory = try await api.fetchHistory(for: "all", limit: 200)
+            let combined = (history + allHistory).sorted { $0.date < $1.date }
+            var seen = Set<String>()
+            messages = combined.filter { seen.insert($0.id).inserted }
+        } catch {
+            showError(error.localizedDescription)
         }
     }
 

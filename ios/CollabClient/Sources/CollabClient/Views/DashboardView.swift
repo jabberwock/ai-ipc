@@ -67,6 +67,7 @@ struct DashboardView: View {
                         }
                         .padding(.vertical, 8)
                     }
+                    .refreshable { await vm.refreshMessages() }
                     .onChange(of: vm.filteredMessages.count) { _, _ in
                         if let last = vm.filteredMessages.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
