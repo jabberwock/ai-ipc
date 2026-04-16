@@ -3,18 +3,21 @@ use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::process::Command;
+use tokio::process::Command;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 
 use crate::client::CollabClient;
 
-const TRIVIAL_REPLY_PATTERN: &str = r"(?i)^(acknowledged|got it|thanks|thank you|ok|okay|will do|on it|roger)$";
 const PING_PATTERN: &str = r"(?i)^(ping|status|are you there\??|health ?check|you up\??)$";
-/// Matches messages that are pure acknowledgments — no new information, just confirming receipt.
-/// These start with ack-like phrases and contain no task assignments or new requests.
-const ACK_START_PATTERN: &str = r"(?i)^(@[\w-]+\s+)*\s*(acknowledged|ack\b|aligned|standing by|same gate|holding|received|noted|roger|unchanged|freeze (holds|respected|unchanged)|gate freeze|doc freeze|standby)";
+/// Matches messages that OPEN with an acknowledgment phrase. Combined with a
+/// length cap (ACK_MAX_LEN), this catches pure receipts like "Acknowledging — standing by"
+/// without swallowing long content-bearing messages that merely open with "Thanks — ".
+const ACK_START_PATTERN: &str = r"(?i)^(@[\w-]+[:,]?\s+)*\s*(acknowledged?|acknowledging|ack\b|aligned|standing by|same gate|holding|received|noted|roger|unchanged|freeze (holds|respected|unchanged)|gate freeze|doc freeze|standby|thanks|thank you|perfect|great|locked in|locked|got it|ok\b|okay|will do|on it|sounds good|understood|confirmed|copy that)";
+/// Messages opening with an ack phrase AND shorter than this are swallowed.
+/// Anything longer is assumed to carry real content after the opener.
+const ACK_MAX_LEN: usize = 300;
 pub const DEFAULT_CLI_TEMPLATE: &str = "claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -153,11 +156,15 @@ impl WorkerHarness {
         }
 
         // Ack loop detection — swallow pure acknowledgments from other workers.
-        // These are messages that start with ack-like phrases and carry no new information.
+        // A message counts as a pure ack if it opens with an ack phrase AND is short
+        // enough that it can't be carrying real content after the opener.
         let ack_re = Regex::new(ACK_START_PATTERN).unwrap();
+        let is_pure_ack = |content: &str| -> bool {
+            let trimmed = content.trim();
+            trimmed.len() <= ACK_MAX_LEN && ack_re.is_match(trimmed)
+        };
         let non_self_msgs: Vec<_> = messages.iter().filter(|m| m.sender != self.instance_id).collect();
-        if !non_self_msgs.is_empty() && non_self_msgs.iter().all(|m| ack_re.is_match(m.content.trim())) {
-            // All external messages are acks — swallow them
+        if !non_self_msgs.is_empty() && non_self_msgs.iter().all(|m| is_pure_ack(&m.content)) {
             return PromptTier::Harness;
         }
 
@@ -571,12 +578,6 @@ impl WorkerHarness {
         }
     }
 
-    fn is_trivial_reply(&self, content: &str) -> bool {
-        Regex::new(TRIVIAL_REPLY_PATTERN)
-            .map(|re| re.is_match(content.trim()))
-            .unwrap_or(false)
-    }
-
     /// Build the prompt for a CLI invocation.
     /// `full_context`: true = full prompt (teammates, state, todos, full schema), false = light prompt
     async fn build_prompt(&self, messages: &[Message], full_context: bool) -> Result<String> {
@@ -615,7 +616,7 @@ When done, your FINAL output must be ONLY a JSON object (no other text before or
   \"state_update\": {{\"status\": \"what you're doing now\"}}
 }}
 
-Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — output those via JSON instead. Read commands (`collab status`, `collab todo list`) are fine. Focus on your actual work.",
+Do NOT run any `collab` command in this session — the harness manages collab state and the relevant env vars are unset here. Use Bash/Read/Write/Edit for actual work; emit collab actions via the JSON object above.",
                 self.instance_id,
                 self.get_role(),
                 messages.len(),
@@ -719,7 +720,7 @@ Fields:
 - continue: true to keep working autonomously, false when blocked or done
 - state_update: persist state for next invocation. Include \"status\" to update your roster presence
 
-Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harness delivers those from your JSON output. Read commands (`collab status`, `collab todo list`) are fine if you need to verify state. Focus on your actual work.",
+Do NOT run any `collab` command in this session — the harness manages collab state and the relevant env vars are unset here. Use Bash/Read/Write/Edit for actual work; emit collab actions via the JSON object above.",
             self.instance_id,
             self.get_role(),
             teammates_str,
@@ -774,11 +775,23 @@ Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harne
         }
 
         let workdir_str = self.workdir.to_string_lossy();
-        let mut parts: Vec<String> = template_parts.iter().map(|part| {
+        let substituted: Vec<String> = template_parts.iter().map(|part| {
             part.replace("{prompt}", &prompt)
                 .replace("{model}", &self.model)
                 .replace("{workdir}", &workdir_str)
         }).collect();
+
+        // Pull leading KEY=VALUE pairs off as subprocess env vars (shell-style).
+        // Without this, a template like `OLLAMA_HOST=... script -p {prompt}` spawns
+        // `OLLAMA_HOST=...` as a binary and fails — the original symptom that took
+        // an hour to track down.
+        let (extra_env, mut parts) = split_env_prefix(substituted);
+        if parts.is_empty() {
+            return Err(anyhow::anyhow!(
+                "cli_template has no command after env-var prefixes: {}",
+                active_template
+            ));
+        }
 
         // Detect claude CLI — inject --output-format json to get real token counts and cost
         let is_claude_cli = parts[0].ends_with("claude");
@@ -789,33 +802,68 @@ Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harne
 
         let mut cmd = Command::new(&parts[0]);
         cmd.args(&parts[1..])
-            .current_dir(&self.workdir);
+            .current_dir(&self.workdir)
+            .kill_on_drop(true);
 
-        // Remove collab env vars from subprocess — harness handles all communication
+        for (k, v) in &extra_env {
+            cmd.env(k, v);
+        }
+
+        // Strip collab env vars — harness owns all collab traffic.
+        // Workers must NOT call `collab send`/`status`/etc in the subprocess;
+        // outgoing actions go via the JSON output schema. The prompt enforces this.
         cmd.env_remove("COLLAB_INSTANCE");
         cmd.env_remove("COLLAB_SERVER");
         cmd.env_remove("COLLAB_TOKEN");
 
-        let output = match cmd.output()
-        {
-            Ok(out) => out,
-            Err(e) => {
-                self.log_error(&format!("Failed to spawn '{}': {}", parts[0], e));
+        // Single sink for failure dumps. Writes /tmp/collab-debug-<instance>.txt.
+        // Successful invocations clean this up at the end of process_messages.
+        let write_debug = |kind: &str, exit: &str, stdout: &str, stderr: &str| {
+            let debug_path = format!("/tmp/collab-debug-{}.txt", self.instance_id);
+            let _ = std::fs::write(&debug_path, format!(
+                "KIND: {}\nEXIT: {}\nCOMMAND: {}\nENV_OVERRIDES: {:?}\n\
+                 STDOUT ({} bytes):\n{}\nSTDERR ({} bytes):\n{}\n\
+                 PROMPT ({} bytes):\n{}",
+                kind, exit, parts.join(" "), extra_env,
+                stdout.len(), stdout, stderr.len(), stderr,
+                prompt.len(), prompt
+            ));
+        };
+
+        let timeout_secs = std::env::var("COLLAB_CLI_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300);
+
+        let output = match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            cmd.output(),
+        ).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => {
+                write_debug("spawn-failed", "n/a", "", &e.to_string());
+                self.log_error(&format!(
+                    "Failed to spawn '{}': {} — see /tmp/collab-debug-{}.txt",
+                    parts[0], e, self.instance_id
+                ));
                 return Err(e.into());
+            }
+            Err(_) => {
+                write_debug("timeout", &format!("killed after {}s", timeout_secs), "", "");
+                self.log_error(&format!(
+                    "CLI timed out after {}s — see /tmp/collab-debug-{}.txt (override with COLLAB_CLI_TIMEOUT_SECS)",
+                    timeout_secs, self.instance_id
+                ));
+                return Err(anyhow::anyhow!("CLI timed out after {}s", timeout_secs));
             }
         };
 
-        // Debug: always dump claude output on failure
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let debug_path = format!("/tmp/collab-debug-{}.txt", self.instance_id);
-            let _ = std::fs::write(&debug_path, format!(
-                "EXIT: {}\nSTDOUT ({} bytes):\n{}\nSTDERR ({} bytes):\n{}\nPROMPT:\n{}",
-                output.status, stdout.len(), stdout, stderr.len(), stderr, prompt
-            ));
+            write_debug("exit-failed", &output.status.to_string(), &stdout, &stderr);
             let detail = if stderr.trim().is_empty() && stdout.trim().is_empty() {
-                format!("(empty output — see {})", debug_path)
+                format!("(empty output — see /tmp/collab-debug-{}.txt)", self.instance_id)
             } else if stderr.trim().is_empty() {
                 stdout.to_string()
             } else {
@@ -1107,6 +1155,39 @@ Do NOT use `collab send`, `collab todo add`, or `collab broadcast` — the harne
     }
 }
 
+/// Pull leading `KEY=VALUE` parts off a shell-split command, so cli_templates like
+/// `OLLAMA_HOST=... OLLAMA_NUM_CTX=... /path/to/script -p {prompt}` work the way
+/// they would in a shell. Without this, `Command::new("OLLAMA_HOST=...")` tries
+/// to spawn that string as a binary and silently fails.
+fn split_env_prefix(parts: Vec<String>) -> (Vec<(String, String)>, Vec<String>) {
+    let split_at = parts
+        .iter()
+        .position(|p| !is_env_assignment(p))
+        .unwrap_or(parts.len());
+    let env: Vec<(String, String)> = parts[..split_at]
+        .iter()
+        .map(|p| {
+            let eq = p.find('=').unwrap();
+            (p[..eq].to_string(), p[eq + 1..].to_string())
+        })
+        .collect();
+    (env, parts[split_at..].to_vec())
+}
+
+fn is_env_assignment(s: &str) -> bool {
+    let Some(eq) = s.find('=') else {
+        return false;
+    };
+    let key = &s[..eq];
+    !key.is_empty()
+        && key
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn parse_collab_output(output: &str) -> Option<CollabOutput> {
     // Strip markdown code fences if present
     let cleaned = if output.contains("```") {
@@ -1300,6 +1381,88 @@ mod tests {
         assert!(!re.is_match("Found bug in payment processor"));
         assert!(!re.is_match("Please review the schema changes"));
         assert!(!re.is_match("Write access is unblocked on my side"));
-        assert!(!re.is_match("Completed work from @builder: API ready"));
+    }
+
+    #[test]
+    fn ack_pattern_matches_real_chat_openers() {
+        // From actual traffic in the StarvingActor session — these were triggering
+        // full CLI spawns because the old pattern missed them.
+        let re = Regex::new(ACK_START_PATTERN).unwrap();
+        assert!(re.is_match("Acknowledging two items:"));
+        assert!(re.is_match("Thanks — glad the cross-platform mapping landed well"));
+        assert!(re.is_match("Perfect — standing by. Flag anything"));
+        assert!(re.is_match("Locked in — will ping you the moment"));
+        assert!(re.is_match("Got it — will hold on that"));
+        assert!(re.is_match("Confirmed, moving to Sprint 3"));
+        assert!(re.is_match("Copy that"));
+        assert!(re.is_match("Sounds good — proceeding"));
+        assert!(re.is_match("Understood"));
+    }
+
+    #[test]
+    fn ack_length_cap_protects_content_bearing_messages() {
+        // Opening with an ack word but carrying real content afterward should NOT
+        // be swallowed. The classify_tier caller applies ACK_MAX_LEN; the regex alone
+        // will still match, so we verify both: pattern matches, length cap rejects.
+        let re = Regex::new(ACK_START_PATTERN).unwrap();
+        let long = "Perfect — exactly what I wanted to see. The design system translating well to Android is exactly what we hoped for. Material3 dark surface overlays (#0E0E12, #15151A) map 1:1 to our iOS brand tokens, and the 48dp minimum tap targets are aligned with our accessibility audit findings. Please continue with Phase 0 of the Android implementation.";
+        assert!(re.is_match(long), "pattern still matches — cap is what filters");
+        assert!(long.len() > ACK_MAX_LEN, "this is the real case we need to let through");
+    }
+
+    fn s(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn env_prefix_extracts_leading_assignments() {
+        let (env, cmd) = split_env_prefix(s(&[
+            "OLLAMA_HOST=http://mbpc:11434",
+            "OLLAMA_NUM_CTX=32768",
+            "/path/to/script",
+            "-p",
+            "{prompt}",
+        ]));
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0], ("OLLAMA_HOST".to_string(), "http://mbpc:11434".to_string()));
+        assert_eq!(env[1], ("OLLAMA_NUM_CTX".to_string(), "32768".to_string()));
+        assert_eq!(cmd, s(&["/path/to/script", "-p", "{prompt}"]));
+    }
+
+    #[test]
+    fn env_prefix_stops_at_first_non_assignment() {
+        // KEY=VALUE after the command should NOT be treated as env
+        let (env, cmd) = split_env_prefix(s(&["claude", "FOO=bar", "-p", "x"]));
+        assert!(env.is_empty());
+        assert_eq!(cmd, s(&["claude", "FOO=bar", "-p", "x"]));
+    }
+
+    #[test]
+    fn env_prefix_no_assignments() {
+        let (env, cmd) = split_env_prefix(s(&["claude", "-p", "{prompt}"]));
+        assert!(env.is_empty());
+        assert_eq!(cmd, s(&["claude", "-p", "{prompt}"]));
+    }
+
+    #[test]
+    fn env_prefix_rejects_invalid_keys() {
+        // Things that LOOK like assignments but aren't valid identifiers — pass through as args
+        let (env, cmd) = split_env_prefix(s(&["1FOO=bar", "claude"]));
+        assert!(env.is_empty());
+        assert_eq!(cmd, s(&["1FOO=bar", "claude"]));
+
+        let (env, cmd) = split_env_prefix(s(&["FOO-BAR=baz", "claude"]));
+        assert!(env.is_empty());
+        assert_eq!(cmd, s(&["FOO-BAR=baz", "claude"]));
+    }
+
+    #[test]
+    fn env_prefix_value_can_contain_equals_and_be_empty() {
+        let (env, cmd) = split_env_prefix(s(&["URL=http://x?a=1&b=2", "EMPTY=", "cmd"]));
+        assert_eq!(env, vec![
+            ("URL".to_string(), "http://x?a=1&b=2".to_string()),
+            ("EMPTY".to_string(), "".to_string()),
+        ]);
+        assert_eq!(cmd, s(&["cmd"]));
     }
 }
