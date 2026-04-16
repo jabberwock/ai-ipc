@@ -596,14 +596,49 @@ impl WorkerHarness {
         }
 
         if !full_context {
-            // Light prompt — minimal context
+            // Light prompt — minimal context, plus a compact recent-history
+            // window so the worker isn't amnesic. Without this, a short reply
+            // like "how tf do I know?" routes to Light, strips all context,
+            // and the worker answers like it's a cold-boot stranger.
+            // Budget: 5 messages × 200 chars ≈ 200 tokens extra — keeps Light
+            // materially cheaper than Full while fixing the obvious failure.
+            let current_hashes: std::collections::HashSet<_> = messages.iter().map(|m| m.hash.as_str()).collect();
+            let history_str = match self.client.fetch_history_pub(&self.instance_id).await {
+                Ok(history) => {
+                    let recent: Vec<_> = history.iter()
+                        .filter(|m| !current_hashes.contains(m.hash.as_str()))
+                        .rev()
+                        .take(5)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    if recent.is_empty() {
+                        String::new()
+                    } else {
+                        let mut lines = String::from("Recent history (for context — act only on the new messages below):\n");
+                        for m in &recent {
+                            let content = if m.content.len() > 200 {
+                                format!("{}…", &m.content[..200])
+                            } else {
+                                m.content.clone()
+                            };
+                            lines.push_str(&format!("  @{} → @{}: {}\n", m.sender, m.recipient, content));
+                        }
+                        lines.push('\n');
+                        lines
+                    }
+                }
+                Err(_) => String::new(),
+            };
+
             return Ok(format!(
                 "You are @{}. Role: {}
 
-Messages ({}):
+{}New messages ({}):
 {}
 
-Act on the messages above. Use Bash/Read/Write/Edit to do your actual work.
+Act on the new messages above. Use Bash/Read/Write/Edit to do your actual work.
 
 When done, your FINAL output must be ONLY a JSON object (no other text before or after):
 
@@ -619,6 +654,7 @@ When done, your FINAL output must be ONLY a JSON object (no other text before or
 Do NOT run any `collab` command in this session — the harness manages collab state and the relevant env vars are unset here. Use Bash/Read/Write/Edit for actual work; emit collab actions via the JSON object above.",
                 self.instance_id,
                 self.get_role(),
+                history_str,
                 messages.len(),
                 msg_lines
             ));
@@ -1024,7 +1060,18 @@ Do NOT run any `collab` command in this session — the harness manages collab s
             if !raw.is_empty() {
                 // If it looks like a failed JSON parse (contains "response" key), don't send raw JSON
                 if raw.contains("\"response\"") && raw.contains("{") {
-                    self.log_error(&format!("JSON parse failed — output looks like structured JSON but couldn't be parsed. Not sending raw JSON to team."));
+                    // Dump raw output so we can see what the model actually produced —
+                    // silent drop with no artifact was untraceable.
+                    let debug_path = format!("/tmp/collab-debug-{}.txt", self.instance_id);
+                    let _ = std::fs::write(&debug_path, format!(
+                        "KIND: json-parse-failed\nRAW_OUTPUT ({} bytes):\n{}\n",
+                        raw.len(), raw
+                    ));
+                    self.log_error(&format!(
+                        "JSON parse failed — output looks like structured JSON but couldn't be parsed. \
+                         Raw dumped to {}. Not sending to team.",
+                        debug_path
+                    ));
                 } else {
                     // Plain text response — send it
                     self.log(&format!("no markers — sending raw response"));
