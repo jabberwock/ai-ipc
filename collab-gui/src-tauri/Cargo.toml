@@ -23,6 +23,9 @@ serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 tokio       = { version = "1", features = ["full"] }
 rand        = "0.8"
+# Canonical per-platform paths: ~/.config on Linux, ~/Library/Application
+# Support on macOS, %APPDATA% on Windows. Used for the wizard's saved config.
+dirs        = "5"
 
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 rfd = "0.15"

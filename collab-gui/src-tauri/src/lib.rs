@@ -42,6 +42,15 @@ pub struct SavedConfig {
     // on its defaults no matter what the wizard did.
     #[serde(default)]
     pub token: String,
+    /// Admin secret (`adm_…` or legacy). Optional — only needed for admin
+    /// operations like `collab team create`. Workers auth with `token`
+    /// (the team token) instead.
+    #[serde(default)]
+    pub admin_token: String,
+    /// Name of the team this wizard is set up for. Written into team.yml's
+    /// top-level `team:` key; also used as a label in the wizard.
+    #[serde(default)]
+    pub team_name: String,
     #[serde(default = "default_server_url")]
     pub server_url: String,
     #[serde(default)]
@@ -64,6 +73,8 @@ impl Default for SavedConfig {
     fn default() -> Self {
         Self {
             token: String::new(),
+            admin_token: String::new(),
+            team_name: String::new(),
             server_url: default_server_url(),
             identity: String::new(),
             project_dir: String::new(),
@@ -75,7 +86,20 @@ impl Default for SavedConfig {
     }
 }
 
+/// Canonical per-platform location for the wizard's saved config.
+/// Linux:   `$XDG_CONFIG_HOME` or `~/.config/hold-my-beer-gui/config.json`
+/// macOS:   `~/Library/Application Support/hold-my-beer-gui/config.json`
+/// Windows: `%APPDATA%\hold-my-beer-gui\config.json`
 pub fn gui_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|base| base.join("hold-my-beer-gui").join("config.json"))
+}
+
+/// Pre-1.0 location — a hard-coded `$HOME/.config/hold-my-beer-gui/...` path
+/// that was wrong on macOS (should be `Library/Application Support`) and
+/// Windows (should be `%APPDATA%`). Kept around so `load_config` can read
+/// it once at startup for users who set up under the old path, then
+/// transparently migrate them to the canonical location on next save.
+pub fn legacy_gui_config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;

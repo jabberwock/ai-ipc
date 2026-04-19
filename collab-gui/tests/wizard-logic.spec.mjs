@@ -1,8 +1,8 @@
-// Tests for the setup wizard's pure-JS logic and the bugs fixed in this PR:
-//   1. parseWorkersYaml correctly reads the shape buildWorkersYaml writes
-//   2. loadExistingProject populates wizard state from an existing workers.yaml
+// Tests for the setup wizard's pure-JS logic and the invariants this PR guards:
+//   1. parseTeamOrWorkersYaml reads the shape buildTeamYaml writes
+//   2. loadExistingProject prefers team.yml, falls back to legacy workers.yaml
 //   3. addWorker / removeWorker preserve in-progress edits to other cards
-//   4. doLaunch does not silently overwrite an existing workers.yaml
+//   4. doLaunch does not silently overwrite an existing team.yml
 //
 // These run against `public/index.html` in plain Chromium. `window.__TAURI__`
 // is replaced per-test with a shim that reads/writes a per-page state object,
@@ -65,41 +65,55 @@ async function setProjectDir(page, dir) {
   }, dir);
 }
 
-// ─── parseWorkersYaml ─────────────────────────────────────────────────────────
+// Step 1 now takes two tokens + a team name. This helper fills the fields
+// + passes validation so later steps can render.
+async function primeStep1(page) {
+  await page.locator('#s1-url').fill('http://localhost:8000');
+  await page.locator('#s1-team-name').fill('test-team');
+  await page.locator('#s1-admin-token').fill('adm_' + 'a'.repeat(32));
+  await page.locator('#s1-token').fill('tm_' + 'b'.repeat(32));
+  await page.locator('#s1-identity').fill('tester');
+  await page.evaluate(() => window.__wizard.step1Next());
+}
 
-test.describe('parseWorkersYaml', () => {
+// ─── parseTeamOrWorkersYaml ───────────────────────────────────────────────────
+
+test.describe('parseTeamOrWorkersYaml', () => {
   test.beforeEach(async ({ page }) => {
     await mockTauri(page);
     await page.goto('/');
   });
 
-  test('parses the exact shape buildWorkersYaml emits', async ({ page }) => {
+  test('parses the exact shape buildTeamYaml emits', async ({ page }) => {
     const yaml = [
+      'team: "demo"',
       'server: http://localhost:8000',
       'cli_template: "claude -p {prompt} --model {model}"',
       'model: haiku',
-      'output_dir: ./workers',
-      'codebase_path: /tmp/proj',
       'workers:',
       '  - name: builder',
       '    role: "Build features"',
+      '    codebase_path: "/tmp/proj"',
       '  - name: reviewer',
       '    role: "Review code"',
+      '    codebase_path: "/tmp/other-repo"',
       '',
     ].join('\n');
-    const parsed = await page.evaluate((y) => window.__wizard.parseWorkersYaml(y), yaml);
+    const parsed = await page.evaluate((y) => window.__wizard.parseTeamOrWorkersYaml(y), yaml);
+    expect(parsed.team).toBe('demo');
     expect(parsed.server).toBe('http://localhost:8000');
     expect(parsed.cli_template).toBe('claude -p {prompt} --model {model}');
     expect(parsed.model).toBe('haiku');
     expect(parsed.workers).toHaveLength(2);
-    expect(parsed.workers[0]).toEqual({ name: 'builder', role: 'Build features' });
-    expect(parsed.workers[1]).toEqual({ name: 'reviewer', role: 'Review code' });
+    expect(parsed.workers[0]).toEqual({ name: 'builder', role: 'Build features', codebase_path: '/tmp/proj' });
+    expect(parsed.workers[1]).toEqual({ name: 'reviewer', role: 'Review code', codebase_path: '/tmp/other-repo' });
   });
 
-  test('round-trips through buildWorkersYaml', async ({ page }) => {
+  test('round-trips through buildTeamYaml', async ({ page }) => {
     // Seed wizard state, build yaml, parse it, assert the important fields survive.
     const result = await page.evaluate(() => {
       window.__wizard.cfg = {
+        teamName:    'round-trip',
         serverUrl:   'http://localhost:8000',
         cliTemplate: 'claude -p {prompt}',
         model:       'sonnet',
@@ -109,14 +123,16 @@ test.describe('parseWorkersYaml', () => {
         { name: 'a', role: 'first' },
         { name: 'b', role: 'second with "quotes"' },
       ];
-      const yaml   = window.__wizard.buildWorkersYaml();
-      const parsed = window.__wizard.parseWorkersYaml(yaml);
+      const yaml   = window.__wizard.buildTeamYaml();
+      const parsed = window.__wizard.parseTeamOrWorkersYaml(yaml);
       return { yaml, parsed };
     });
+    expect(result.parsed.team).toBe('round-trip');
     expect(result.parsed.model).toBe('sonnet');
     expect(result.parsed.cli_template).toBe('claude -p {prompt}');
     expect(result.parsed.workers).toHaveLength(2);
     expect(result.parsed.workers[0].name).toBe('a');
+    expect(result.parsed.workers[0].codebase_path).toBe('/tmp/proj');
     expect(result.parsed.workers[1].role).toContain('quotes');
   });
 });
@@ -124,20 +140,24 @@ test.describe('parseWorkersYaml', () => {
 // ─── loadExistingProject ──────────────────────────────────────────────────────
 
 test.describe('loadExistingProject', () => {
-  test('populates wizard state when workers.yaml exists at the chosen dir', async ({ page }) => {
+  test('populates wizard state when team.yml exists at the chosen dir', async ({ page }) => {
     await mockTauri(page, {
       files: {
-        '/tmp/proj/workers.yaml': [
+        '/tmp/proj/team.yml': [
+          'team: "alpha-team"',
           'server: http://localhost:8000',
           'cli_template: "claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit"',
           'model: opus',
           'workers:',
           '  - name: alpha',
           '    role: "Alpha role"',
+          '    codebase_path: "/tmp/proj"',
           '  - name: beta',
           '    role: "Beta role"',
+          '    codebase_path: "/tmp/proj"',
           '  - name: gamma',
           '    role: "Gamma role"',
+          '    codebase_path: "/tmp/proj"',
           '',
         ].join('\n'),
       },
@@ -147,13 +167,15 @@ test.describe('loadExistingProject', () => {
     expect(loaded).toBe(true);
 
     const state = await page.evaluate(() => ({
-      workers: window.__wizard.workers,
-      model:   window.__wizard.cfg.model,
-      tmpl:    window.__wizard.cfg.cliTemplate,
+      workers:   window.__wizard.workers,
+      model:     window.__wizard.cfg.model,
+      tmpl:      window.__wizard.cfg.cliTemplate,
+      teamName:  window.__wizard.cfg.teamName,
     }));
     expect(state.workers).toHaveLength(3);
     expect(state.workers.map(w => w.name)).toEqual(['alpha', 'beta', 'gamma']);
     expect(state.model).toBe('opus');
+    expect(state.teamName).toBe('alpha-team');
 
     // Worker cards should be rendered with the loaded values.
     const cardNames = await page.locator('.worker-card .wc-name').evaluateAll(
@@ -162,7 +184,28 @@ test.describe('loadExistingProject', () => {
     expect(cardNames).toEqual(['alpha', 'beta', 'gamma']);
   });
 
-  test('returns false and leaves state alone when the file is missing', async ({ page }) => {
+  test('falls back to legacy workers.yaml when team.yml is absent', async ({ page }) => {
+    await mockTauri(page, {
+      files: {
+        '/tmp/proj/workers.yaml': [
+          'server: http://localhost:8000',
+          'cli_template: "claude -p {prompt}"',
+          'model: sonnet',
+          'workers:',
+          '  - name: old-builder',
+          '    role: "Legacy role"',
+          '',
+        ].join('\n'),
+      },
+    });
+    await page.goto('/');
+    const loaded = await callFn(page, 'loadExistingProject', '/tmp/proj');
+    expect(loaded).toBe(true);
+    const names = await page.evaluate(() => window.__wizard.workers.map(w => w.name));
+    expect(names).toEqual(['old-builder']);
+  });
+
+  test('returns false and leaves state alone when neither file exists', async ({ page }) => {
     await mockTauri(page, { files: {} });
     await page.goto('/');
     const before = await page.evaluate(() => window.__wizard.workers.map(w => w.name));
@@ -180,10 +223,7 @@ test.describe('addWorker / removeWorker preserve in-progress edits', () => {
     await mockTauri(page);
     await page.goto('/');
     // Advance the wizard to step 3 so worker cards are mounted.
-    await page.locator('#s1-token').fill('x'.repeat(32));
-    await page.locator('#s1-url').fill('http://localhost:8000');
-    await page.locator('#s1-identity').fill('tester');
-    await page.evaluate(() => window.__wizard.step1Next());
+    await primeStep1(page);
     await setProjectDir(page, '/tmp/proj');
     await page.evaluate(() => window.__wizard.step2Next());
   });
@@ -216,10 +256,7 @@ test.describe('addWorker / removeWorker preserve in-progress edits', () => {
 
   // Real-user flow: type character-by-character into two cards, then click
   // the actual "+ Add worker" button, then type into the new card. This is
-  // the exact sequence the user hit that cost them a redteamer worker, and
-  // uses `pressSequentially` + real button click rather than `.fill()` and
-  // direct function calls, so timing/event differences vs the other tests
-  // can't hide the bug.
+  // the exact sequence the user hit that cost them a redteamer worker.
   test('real-user flow: type-rename, click +Add, type new worker — all three stick', async ({ page }) => {
     const cards = page.locator('.worker-card');
     await expect(cards).toHaveCount(2);
@@ -274,36 +311,34 @@ test.describe('addWorker / removeWorker preserve in-progress edits', () => {
   });
 });
 
-// ─── doLaunch does not silently overwrite an existing workers.yaml ────────────
+// ─── doLaunch does not silently overwrite an existing team.yml ────────────────
 
 test.describe('doLaunch overwrite guard', () => {
-  // Must exactly match the bytes that buildWorkersYaml() emits — any drift
-  // and the doLaunch overwrite-guard round-trip test will incorrectly report
-  // a change and trigger a write. buildWorkersYaml quotes every scalar value
-  // (YAML-injection hardening, commit 3ae56ee).
+  // Must exactly match the bytes that buildTeamYaml() emits — any drift
+  // and the doLaunch overwrite-guard round-trip test will incorrectly
+  // report a change and trigger a write.
   const existingYaml = [
+    'team: "test-team"',
     'server: "http://localhost:8000"',
     'cli_template: "claude -p {prompt} --model {model} --allowedTools Bash,Read,Write,Edit"',
     'model: "haiku"',
-    'output_dir: ./workers',
-    'codebase_path: "/tmp/proj"',
     'workers:',
     '  - name: alpha',
     '    role: "Alpha role"',
+    '    codebase_path: "/tmp/proj"',
     '  - name: beta',
     '    role: "Beta role"',
+    '    codebase_path: "/tmp/proj"',
     '  - name: redteamer',
     '    role: "Red team"',
+    '    codebase_path: "/tmp/proj"',
     '',
   ].join('\n');
 
   async function primeWizard(page) {
-    await mockTauri(page, { files: { '/tmp/proj/workers.yaml': existingYaml } });
+    await mockTauri(page, { files: { '/tmp/proj/team.yml': existingYaml } });
     await page.goto('/');
-    await page.locator('#s1-token').fill('x'.repeat(32));
-    await page.locator('#s1-url').fill('http://localhost:8000');
-    await page.locator('#s1-identity').fill('tester');
-    await page.evaluate(() => window.__wizard.step1Next());
+    await primeStep1(page);
     // Load the existing project (what doBrowse does after picking a dir).
     await setProjectDir(page, '/tmp/proj');
     await callFn(page, 'loadExistingProject', '/tmp/proj');
@@ -318,7 +353,7 @@ test.describe('doLaunch overwrite guard', () => {
     // write_file should not have been called.
     await page.evaluate(() => { window.__wizard.doLaunch(); });
     await page.waitForFunction(
-      () => window.__test.calls.some(c => c.cmd === 'read_file' && c.args.path === '/tmp/proj/workers.yaml')
+      () => window.__test.calls.some(c => c.cmd === 'read_file' && c.args.path === '/tmp/proj/team.yml')
     );
     // Give the microtask after path_exists/read_file a tick to run.
     await page.waitForTimeout(50);
@@ -343,7 +378,7 @@ test.describe('doLaunch overwrite guard', () => {
       () => window.__test.calls.some(c => c.cmd === 'start_server')
     );
     // The file should reflect the rename.
-    const contents = await page.evaluate(() => window.__test.files['/tmp/proj/workers.yaml']);
+    const contents = await page.evaluate(() => window.__test.files['/tmp/proj/team.yml']);
     expect(contents).toContain('name: webdev');
     expect(contents).not.toContain('name: alpha'); // the old name for index 0
   });

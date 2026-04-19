@@ -28,7 +28,7 @@
 
   <div class="wiz-steps-wrap">
 
-      <!-- ── Step 1: Token + identity ─────────────────────────────────── -->
+      <!-- ── Step 1: Tokens + identity ────────────────────────────────── -->
       <div class="step active" id="step-1">
         <div class="step-icon">🍺</div>
         <h1 class="step-title">Hold My Beer</h1>
@@ -36,17 +36,35 @@
 
         <div class="step-fields">
           <div class="field">
-            <label for="s1-token">Server Token</label>
-            <div class="token-row">
-              <input id="s1-token" class="inp inp-mono" type="password" placeholder="your-secret-token" autocomplete="off" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">
-              <button class="btn btn-ghost btn-sm" id="btn-gen-token" title="Generate a secure random token">Generate</button>
-            </div>
-            <div class="hint-box u-mt-4">Authenticates all agents. Will be saved to <code>~/.collab.toml</code>.</div>
+            <label for="s1-url">Server URL</label>
+            <input id="s1-url" class="inp inp-mono" type="text" value="http://localhost:8000">
           </div>
 
           <div class="field">
-            <label for="s1-url">Server URL</label>
-            <input id="s1-url" class="inp inp-mono" type="text" value="http://localhost:8000">
+            <label for="s1-admin-token">Admin Token <span class="field-optional">(for creating a team)</span></label>
+            <div class="token-row">
+              <input id="s1-admin-token" class="inp inp-mono" type="password" placeholder="adm_… or legacy admin secret" autocomplete="off" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">
+              <button class="btn btn-ghost btn-sm" id="btn-gen-admin-token" title="Generate a secure random admin token">Generate</button>
+            </div>
+            <div class="hint-box u-mt-4">Needed only to create or rotate teams. Set as <code>COLLAB_ADMIN_TOKEN</code> on the server.</div>
+          </div>
+
+          <div class="field">
+            <label for="s1-team-name">Team</label>
+            <div class="token-row">
+              <input id="s1-team-name" class="inp inp-mono" type="text" placeholder="my-team" autocomplete="off" spellcheck="false">
+              <button class="btn btn-ghost btn-sm" id="btn-create-team" title="Mint a team token by calling the admin API">Create team</button>
+            </div>
+            <div class="hint-box u-mt-4">Short name for this team (lowercase, letters/numbers/hyphens). Stored in <code>team.yml</code>.</div>
+          </div>
+
+          <div class="field">
+            <label for="s1-token">Team Token</label>
+            <div class="token-row">
+              <input id="s1-token" class="inp inp-mono" type="password" placeholder="tm_…" autocomplete="off" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true">
+              <button class="btn btn-ghost btn-sm" id="btn-paste-team-token" title="I already have a team token">Paste</button>
+            </div>
+            <div class="hint-box u-mt-4">Authenticates every worker. Click <strong>Create team</strong> above to mint a new one, or paste an existing <code>tm_…</code> token.</div>
           </div>
 
           <div class="field">
@@ -94,7 +112,7 @@
       <div class="step future" id="step-3">
         <div class="step-icon">🤖</div>
         <h2 class="step-title">Build Your Team</h2>
-        <p class="step-sub">Add the AI workers that will collaborate. Each gets a name and a role that defines what they do.</p>
+        <p class="step-sub">Add the AI workers that will collaborate. Each gets a name and a role. Use the advanced panel to point a worker at a different codebase folder if your team spans multiple repos.</p>
 
         <div class="step-fields">
           <div class="field">

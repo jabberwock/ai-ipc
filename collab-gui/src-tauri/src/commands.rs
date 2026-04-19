@@ -4,15 +4,24 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
 
-use crate::{gui_config_path, collab_toml_path, AppState, SavedConfig};
+use crate::{gui_config_path, legacy_gui_config_path, collab_toml_path, AppState, SavedConfig};
 
 // ─── Config commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub fn load_config() -> SavedConfig {
+    // Prefer the canonical platform-native location. If nothing is there,
+    // fall back to the old hard-coded `$HOME/.config/...` path so users
+    // who set up before the fix don't lose their wizard state. The first
+    // subsequent save_config call rewrites at the canonical path.
+    let from = |p: PathBuf| -> Option<SavedConfig> {
+        std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    };
     gui_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(from)
+        .or_else(|| legacy_gui_config_path().and_then(from))
         .unwrap_or_default()
 }
 
@@ -26,12 +35,22 @@ pub fn save_config(config: SavedConfig) -> Result<(), String> {
         std::fs::write(&path, json).map_err(|e| e.to_string())?;
     }
 
-    // Also write ~/.collab.toml so the collab CLI picks up token + host
+    // Also write ~/.collab.toml so the collab CLI picks up token + host.
+    // The admin token is written as a comment so users can see it exists,
+    // but the CLI reads admin tokens from COLLAB_ADMIN_TOKEN env only (we
+    // don't want two admin secrets auto-loading if someone has a legacy
+    // token in ~/.collab.toml).
     if let Some(toml_path) = collab_toml_path() {
-        let toml = format!(
+        let mut toml = format!(
             "host = \"{}\"\ntoken = \"{}\"\n",
             config.server_url, config.token
         );
+        if !config.admin_token.is_empty() {
+            toml.push_str(&format!(
+                "# admin_token = \"{}\"  # set COLLAB_ADMIN_TOKEN in your shell to use\n",
+                config.admin_token
+            ));
+        }
         std::fs::write(toml_path, toml).map_err(|e| e.to_string())?;
     }
 

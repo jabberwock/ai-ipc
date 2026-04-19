@@ -15,7 +15,9 @@ const _isTauri = !!(_T && _T.core);
 
 // ── App state ─────────────────────────────────────────────────────────────────
 let cfg = {
-  token:         '',
+  token:         '',   // team token (tm_…) — what workers auth with
+  adminToken:    '',   // admin secret (adm_… / legacy) — only for team creation/rotation
+  teamName:      '',   // team.yml `team:` key
   serverUrl:     'http://localhost:8000',
   identity:      'human',
   projectDir:    '',
@@ -106,10 +108,12 @@ const CLI_TEMPLATES = {
 
 // ── Wizard helpers ────────────────────────────────────────────────────────────
 function prefillWizard() {
-  if (cfg.token)      document.getElementById('s1-token').value    = cfg.token;
-  if (cfg.serverUrl)  document.getElementById('s1-url').value      = cfg.serverUrl;
-  if (cfg.identity)   document.getElementById('s1-identity').value = cfg.identity;
-  if (cfg.projectDir) document.getElementById('s2-dir').value      = cfg.projectDir;
+  if (cfg.token)       document.getElementById('s1-token').value       = cfg.token;
+  if (cfg.adminToken)  document.getElementById('s1-admin-token').value = cfg.adminToken;
+  if (cfg.teamName)    document.getElementById('s1-team-name').value   = cfg.teamName;
+  if (cfg.serverUrl)   document.getElementById('s1-url').value         = cfg.serverUrl;
+  if (cfg.identity)    document.getElementById('s1-identity').value    = cfg.identity;
+  if (cfg.projectDir)  document.getElementById('s2-dir').value         = cfg.projectDir;
   renderWorkerCards();
 }
 
@@ -164,18 +168,83 @@ function backFromWizard() {
 
 // Step 1 validation
 function step1Next() {
-  const token    = document.getElementById('s1-token').value.trim();
-  const url      = document.getElementById('s1-url').value.trim();
-  const identity = document.getElementById('s1-identity').value.trim();
+  const token      = document.getElementById('s1-token').value.trim();
+  const adminToken = document.getElementById('s1-admin-token').value.trim();
+  const teamName   = document.getElementById('s1-team-name').value.trim();
+  const url        = document.getElementById('s1-url').value.trim();
+  const identity   = document.getElementById('s1-identity').value.trim();
 
-  if (!token)    { toast('Enter or generate a token first.', true); return; }
-  if (!url)      { toast('Enter the server URL.', true); return; }
+  if (!url)       { toast('Enter the server URL.', true); return; }
+  if (!teamName)  { toast('Enter a team name (or click Create team).', true); return; }
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(teamName)) {
+    toast('Team name must be lowercase letters/numbers/hyphens, starting with a letter or number.', true);
+    return;
+  }
+  if (!token) {
+    toast('Need a team token — click Create team, or paste an existing tm_… token.', true);
+    return;
+  }
   if (!identity) { toast('Enter your name for the chat.', true); return; }
 
-  cfg.token     = token;
-  cfg.serverUrl = url;
-  cfg.identity  = identity;
+  cfg.token      = token;
+  cfg.adminToken = adminToken;  // may be empty — only required for admin ops
+  cfg.teamName   = teamName;
+  cfg.serverUrl  = url;
+  cfg.identity   = identity;
   goStep(2);
+}
+
+// Mint a team via the admin API: POST /admin/teams with the admin token,
+// receive back a fresh tm_… team token, drop it into the team-token field.
+async function createTeam() {
+  const url        = document.getElementById('s1-url').value.trim().replace(/\/+$/, '');
+  const adminToken = document.getElementById('s1-admin-token').value.trim();
+  const teamName   = document.getElementById('s1-team-name').value.trim();
+  if (!url)        { toast('Enter the server URL first.', true); return; }
+  if (!adminToken) { toast('Enter an admin token first (the server\'s COLLAB_ADMIN_TOKEN).', true); return; }
+  if (!teamName)   { toast('Enter a team name to create.', true); return; }
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(teamName)) {
+    toast('Team name must be lowercase letters/numbers/hyphens.', true);
+    return;
+  }
+  const btn = document.getElementById('btn-create-team');
+  if (btn) { btn.disabled = true; btn.textContent = 'Creating…'; }
+  try {
+    const resp = await fetch(url + '/admin/teams', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: teamName }),
+    });
+    if (resp.status === 401) {
+      toast('Server rejected the admin token (401). Is COLLAB_ADMIN_TOKEN set on the server?', true);
+      return;
+    }
+    if (resp.status === 403) {
+      toast('Forbidden (403) — this token isn\'t an admin token.', true);
+      return;
+    }
+    if (resp.status === 409) {
+      toast(`Team "${teamName}" already exists — paste its existing team token instead.`, true);
+      return;
+    }
+    if (!resp.ok) {
+      toast(`Create team failed: HTTP ${resp.status}`, true);
+      return;
+    }
+    const data = await resp.json();
+    if (!data.token) { toast('Server created the team but returned no token — check server logs.', true); return; }
+    document.getElementById('s1-token').value = data.token;
+    cfg.token    = data.token;
+    cfg.teamName = teamName;
+    toast(`Team "${teamName}" created — token filled in.`);
+  } catch (e) {
+    toast('Could not reach server: ' + e, true);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Create team'; }
+  }
 }
 
 // Step 2 validation
@@ -205,9 +274,11 @@ function step3Next() {
     const existing = workers[Array.from(cards).indexOf(card)] || {};
     const modelEl = card.querySelector('.wc-model');
     const tmplEl  = card.querySelector('.wc-cli-template');
+    const cbEl    = card.querySelector('.wc-codebase');
     const entry = { ...existing, name, role };
     if (modelEl) entry.model = modelEl.value.trim() || undefined;
     if (tmplEl)  entry.cli_template = tmplEl.value.trim() || undefined;
+    if (cbEl)    entry.codebase_path = cbEl.value.trim() || undefined;
     updated.push(entry);
   });
   if (!ok) return;
@@ -236,7 +307,7 @@ function renderWorkerCards() {
   workers.forEach((w, i) => {
     const div = document.createElement('div');
     div.className = 'worker-card';
-    const hasAdvanced = w.model || w.cli_template;
+    const hasAdvanced = w.model || w.cli_template || w.codebase_path;
     div.innerHTML = `
       <div class="wc-top">
         <div class="field">
@@ -251,6 +322,11 @@ function renderWorkerCards() {
       <div class="wc-advanced-wrap">
         <button type="button" class="btn btn-ghost btn-xs wc-adv-toggle">${hasAdvanced ? '▾' : '▸'} Advanced</button>
         <div class="wc-advanced" ${hasAdvanced ? '' : 'hidden'}>
+          <div class="field">
+            <label>Codebase path override</label>
+            <input class="inp wc-codebase inp-mono" type="text" value="${esc(w.codebase_path || '')}" placeholder="(use project folder from Step 2)">
+            <div class="hint-box">Absolute path. Set this when a worker lives in a different repo than the rest of the team.</div>
+          </div>
           <div class="field">
             <label>Model override</label>
             <input class="inp wc-model inp-mono" type="text" value="${esc(w.model || '')}" placeholder="(use default)">
@@ -289,6 +365,7 @@ function syncWorkersFromDom() {
     const roleEl = card.querySelector('.wc-role');
     const modelEl = card.querySelector('.wc-model');
     const tmplEl  = card.querySelector('.wc-cli-template');
+    const cbEl    = card.querySelector('.wc-codebase');
     const existing = workers[i] || {};
     const entry = {
       ...existing,
@@ -297,6 +374,7 @@ function syncWorkersFromDom() {
     };
     if (modelEl) entry.model = modelEl.value.trim() || undefined;
     if (tmplEl)  entry.cli_template = tmplEl.value.trim() || undefined;
+    if (cbEl)    entry.codebase_path = cbEl.value.trim() || undefined;
     updated.push(entry);
   });
   workers = updated;
@@ -325,17 +403,38 @@ function _diagBanner(msg, kind) {
   el.textContent = msg;
 }
 
-async function doGenerateToken() {
+function generateHexToken(bytes = 32) {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Generate a fresh admin secret. Intended to be set as COLLAB_ADMIN_TOKEN on
+// the server; the human is responsible for wiring the server side. We prefix
+// with `adm_` so the CLI's token-kind detection shows "admin token".
+async function doGenerateAdminToken() {
+  const input = document.getElementById('s1-admin-token');
+  if (!input) return;
+  input.value = 'adm_' + generateHexToken(32);
+  input.type = 'text';
+  setTimeout(() => { input.type = 'password'; }, 4000);
+}
+
+// Convenience: read a team token from the clipboard. Saves the user a
+// paste-into-masked-field step, and flips the field visible briefly so
+// they can verify they got the right one.
+async function doPasteTeamToken() {
   const input = document.getElementById('s1-token');
   if (!input) return;
-
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  const token = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-
-  input.value = token;
-  input.type = 'text';
-  setTimeout(() => { input.type = 'password'; }, 3000);
+  try {
+    const text = (await navigator.clipboard.readText()).trim();
+    if (!text) { toast('Clipboard is empty.', true); return; }
+    input.value = text;
+    input.type = 'text';
+    setTimeout(() => { input.type = 'password'; }, 3000);
+  } catch (e) {
+    toast('Could not read clipboard — paste manually into the field.', true);
+  }
 }
 
 window.addEventListener('error', (e) => {
@@ -358,21 +457,29 @@ async function doBrowse() {
   }
 }
 
-// If <dir>/workers.yaml exists, parse it and populate the wizard state so the
-// user sees their existing project instead of the blank defaults.
+// If <dir>/team.yml (preferred) or <dir>/workers.yaml exists, parse it and
+// populate the wizard state so the user sees their existing project
+// instead of the blank defaults. team.yml wins — workers.yaml is only
+// read as a legacy fallback for projects that predate the team refactor.
 async function loadExistingProject(dir) {
-  const yamlPath = dir + '/workers.yaml';
-  let exists = false;
-  try { exists = await invoke('path_exists', { path: yamlPath }); } catch (e) {}
-  if (!exists) return false;
+  const teamPath    = dir + '/team.yml';
+  const legacyPath  = dir + '/workers.yaml';
+  let yamlPath = null;
+  let sourceLabel = null;
+  try {
+    if (await invoke('path_exists', { path: teamPath }))   { yamlPath = teamPath;   sourceLabel = 'team.yml'; }
+    else if (await invoke('path_exists', { path: legacyPath })) { yamlPath = legacyPath; sourceLabel = 'workers.yaml'; }
+  } catch (e) {}
+  if (!yamlPath) return false;
 
   let text = '';
   try { text = await invoke('read_file', { path: yamlPath }); }
-  catch (e) { toast('Found workers.yaml but could not read it: ' + e, true); return false; }
+  catch (e) { toast(`Found ${sourceLabel} but could not read it: ` + e, true); return false; }
 
-  const parsed = parseWorkersYaml(text);
+  const parsed = parseTeamOrWorkersYaml(text);
   if (!parsed) return false;
 
+  if (parsed.team)         { cfg.teamName = parsed.team; const el = document.getElementById('s1-team-name'); if (el) el.value = parsed.team; }
   if (parsed.cli_template) cfg.cliTemplate = parsed.cli_template;
   if (parsed.model)        cfg.model       = parsed.model;
   if (parsed.workers && parsed.workers.length) workers = parsed.workers;
@@ -394,14 +501,15 @@ async function loadExistingProject(dir) {
   if (modelEl && cfg.model) modelEl.value = cfg.model;
   renderWorkerCards();
 
-  toast('Loaded existing workers.yaml from ' + dir);
+  toast(`Loaded existing ${sourceLabel} from ${dir}`);
   return true;
 }
 
-// Minimal parser for the exact shape buildWorkersYaml produces: flat scalar
-// keys plus a `workers:` list of `- name: x` / `  role: "y"` pairs. Not a
+// Minimal parser for the exact shape buildTeamYaml (and legacy
+// buildWorkersYaml) produces: flat scalar keys plus a `workers:` list of
+// `- name: x` / `  role: "y"` / `  codebase_path: "z"` rows. Not a
 // general YAML parser — anything fancier is ignored.
-function parseWorkersYaml(text) {
+function parseTeamOrWorkersYaml(text) {
   const out = { workers: [] };
   const lines = text.split(/\r?\n/);
   const unquote = s => {
@@ -454,21 +562,22 @@ async function doLaunch() {
   // of auto-jumping to the dashboard before they can read the error.
   let launchHadError = false;
 
+  // Workers auth with the team token via COLLAB_TOKEN. The admin token goes
+  // in as COLLAB_ADMIN_TOKEN only if the human supplied one — so non-admin
+  // setups don't mint a phantom admin context.
   const envs = [
     ['COLLAB_TOKEN', cfg.token],
     ['COLLAB_SERVER', cfg.serverUrl],
     ['COLLAB_INSTANCE', cfg.identity || 'gui'],
   ];
+  if (cfg.adminToken) envs.push(['COLLAB_ADMIN_TOKEN', cfg.adminToken]);
 
-  // Step 1: Write workers.yaml. Skip the write when the current wizard
-  // state exactly matches what's on disk (so a re-launch is a no-op), but
+  // Step 1: Write team.yml. Skip the write when the current wizard state
+  // exactly matches what's on disk (so a re-launch is a no-op), but
   // otherwise always write — the user went through the wizard on purpose.
-  // A previous version prompted via `window.confirm()` on differences, but
-  // `confirm()` in a Tauri webview can silently return false, which was
-  // throwing away intentional renames.
   setLaunchItem('li-config', 'running');
-  const yaml = buildWorkersYaml();
-  const yamlPath = cfg.projectDir + '/workers.yaml';
+  const yaml = buildTeamYaml();
+  const yamlPath = cfg.projectDir + '/team.yml';
   let existing = null;
   try {
     const exists = await invoke('path_exists', { path: yamlPath });
@@ -477,13 +586,13 @@ async function doLaunch() {
 
   if (existing === yaml) {
     setLaunchItem('li-config', 'done');
-    appendLaunchLog('• workers.yaml unchanged, skipping write', false);
+    appendLaunchLog('• team.yml unchanged, skipping write', false);
   } else {
     appendLaunchLog((existing === null ? 'Writing ' : 'Updating ') + yamlPath, false);
     try {
       await invoke('write_file', { path: yamlPath, content: yaml });
       setLaunchItem('li-config', 'done');
-      appendLaunchLog(existing === null ? '✓ workers.yaml written' : '✓ workers.yaml updated', false);
+      appendLaunchLog(existing === null ? '✓ team.yml written' : '✓ team.yml updated', false);
     } catch (e) {
       setLaunchItem('li-config', 'error', e);
       appendLaunchLog('✗ ' + e, true);
@@ -547,13 +656,15 @@ async function doLaunch() {
     }
   }
 
-  // Step 3: collab init
+  // Step 3: collab init. The CLI sniffs the yaml and picks the team-init
+  // code path because our file starts with `team:`, writing AGENT.md +
+  // .collab/team-managed into each worker's codebase_path.
   setLaunchItem('li-init', 'running');
-  appendLaunchLog('Running: collab init workers.yaml', false);
+  appendLaunchLog('Running: collab init team.yml', false);
   try {
     const code = await invoke('run_command', {
       program: 'collab',
-      args:    ['init', 'workers.yaml'],
+      args:    ['init', 'team.yml'],
       cwd:     cfg.projectDir,
       envs,
     });
@@ -643,20 +754,22 @@ function clearLaunchLog() {
   if (log) log.innerHTML = '';
 }
 
-function buildWorkersYaml() {
-  // Escape a string for use inside a double-quoted YAML scalar:
-  // collapse any CR/LF variants to a space so the value stays on one line.
-  const yamlStr = s => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n|\r/g, ' ');
+// Emit team.yml (current backend schema). Each worker owns its own
+// `codebase_path`; when the user didn't override, we fall back to the
+// project folder picked in Step 2 so the yaml is always valid.
+function buildTeamYaml() {
+  const yamlStr = s => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r?\n|\r/g, ' ');
   const lines = [];
+  lines.push(`team: "${yamlStr(cfg.teamName)}"`);
   lines.push(`server: "${yamlStr(cfg.serverUrl)}"`);
   lines.push(`cli_template: "${yamlStr(cfg.cliTemplate)}"`);
   if (cfg.model) lines.push(`model: "${yamlStr(cfg.model)}"`);
-  lines.push(`output_dir: ./workers`);
-  lines.push(`codebase_path: "${yamlStr(cfg.projectDir)}"`);
   lines.push(`workers:`);
   for (const w of workers) {
+    const cbPath = (w.codebase_path && w.codebase_path.trim()) || cfg.projectDir;
     lines.push(`  - name: ${w.name}`);
     lines.push(`    role: "${yamlStr(w.role)}"`);
+    lines.push(`    codebase_path: "${yamlStr(cbPath)}"`);
     if (w.model) lines.push(`    model: "${yamlStr(w.model)}"`);
     if (w.cli_template) lines.push(`    cli_template: "${yamlStr(w.cli_template)}"`);
   }
@@ -1753,12 +1866,12 @@ document.getElementById('todos-panel').classList.add('collapsed');
 // classic <script>. Expose a minimal bridge — token is intentionally excluded
 // from the getter to avoid leaking credentials via window inspection.
 window.__wizard = {
-  get cfg()        { const { token: _t, ...safe } = cfg; return safe; },
-  set cfg(v)       { const { token: _t, ...rest } = v; Object.assign(cfg, rest); },
+  get cfg()        { const { token: _t, adminToken: _a, ...safe } = cfg; return safe; },
+  set cfg(v)       { const { token: _t, adminToken: _a, ...rest } = v; Object.assign(cfg, rest); },
   get workers()    { return workers; },
   set workers(v)   { workers = v; },
-  parseWorkersYaml,
-  buildWorkersYaml,
+  parseTeamOrWorkersYaml,
+  buildTeamYaml,
   loadExistingProject,
   syncWorkersFromDom,
   addWorker,
@@ -1792,9 +1905,11 @@ window.__wizard = {
   }, true);
 
   // Wizard — step navigation + actions
-  on('btn-gen-token',   'click', doGenerateToken);
-  on('btn-step1-next',  'click', step1Next);
-  on('btn-browse',      'click', doBrowse);
+  on('btn-gen-admin-token', 'click', doGenerateAdminToken);
+  on('btn-create-team',     'click', createTeam);
+  on('btn-paste-team-token','click', doPasteTeamToken);
+  on('btn-step1-next',      'click', step1Next);
+  on('btn-browse',          'click', doBrowse);
   on('btn-step2-next',  'click', step2Next);
   on('btn-step3-next',  'click', step3Next);
   on('btn-add-worker',  'click', addWorker);
