@@ -417,6 +417,11 @@ impl WorkerHarness {
                         // cli_lock serializes invocations — only one claude process at a time.
                         let cli_lock = cli_lock.clone();
                         let batch_status = batch_status.clone();
+                        // Clones reserved for the panic-monitor task (must live
+                        // outside the handle's `async move` since they're used
+                        // AFTER the handle panics).
+                        let batch_status_for_monitor = batch_status.clone();
+                        let role_for_monitor = harness.get_role();
                         let queue = queue.clone();
                         let first_time_for_kick = first_time.clone();
                         let instance_id_for_kick = instance_id.clone();
@@ -504,12 +509,39 @@ impl WorkerHarness {
                             }
                         });
 
-                        // Monitor for panics — log them so they're not silently swallowed
+                        // Monitor for panics in the CLI-spawn task. The panic
+                        // hook in main.rs captures the site and payload, but
+                        // we ALSO need to reset batch_status here — the CLI
+                        // task sets it to "working on msg from …" just before
+                        // spawn_cli and only resets it in the happy-path
+                        // post-CLI block. A panic in between leaves presence
+                        // frozen on "working" forever, with no claude process
+                        // to back it up — the exact silent-stall mode that
+                        // was undiagnosable before the panic hook existed.
+                        let status_recovery = batch_status_for_monitor.clone();
+                        let role_recovery = role_for_monitor.clone();
+                        let hb_recovery = hb_client.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle.await {
                                 if e.is_panic() {
-                                    eprintln!("[{}] [{}] CLI task panicked — cli_lock released, batch loop continues",
+                                    let msg = format!(
+                                        "[{}] [{}] CLI task panicked — resetting status, cli_lock released",
                                         Utc::now().format("%H:%M:%S UTC"), instance_id_for_log);
+                                    eprintln!("{msg}");
+                                    // Best-effort append to the worker error
+                                    // log so GUI-launched workers (stderr
+                                    // null'd) leave a trace.
+                                    use std::io::Write;
+                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                        .create(true).append(true)
+                                        .open("/tmp/collab-worker-errors.log")
+                                    {
+                                        let _ = f.write_all(format!("{msg}\n").as_bytes());
+                                    }
+                                    // Unstick presence — status goes back to
+                                    // role so the roster stops lying.
+                                    *status_recovery.lock().await = role_recovery.clone();
+                                    let _ = hb_recovery.heartbeat(Some(&role_recovery)).await;
                                 }
                             }
                         });

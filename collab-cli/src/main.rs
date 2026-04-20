@@ -549,6 +549,46 @@ async fn main() -> Result<()> {
             )
         })?;
 
+        // Install a panic hook that writes to /tmp/collab-worker-errors.log.
+        // Workers spawned by the GUI have stderr redirected to /dev/null
+        // (see collab-gui commands::resolve_user_path + lifecycle's
+        // configure_detached_stdio), so Rust's default panic output vanishes.
+        // Without this hook, a panic inside the batch-processor or CLI-spawn
+        // task produces a silent stall: the heartbeat keeps firing (it lives
+        // in a different task) and presence says "working on msg from …"
+        // forever, with no error ever surfaced. Panic details go through
+        // the same log file as our log_error path so `tail` shows both.
+        {
+            let panicking_instance = instance_id.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                use std::io::Write;
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                let location = info.location()
+                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                    .unwrap_or_else(|| "<unknown>".into());
+                let payload = info.payload();
+                let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".into()
+                };
+                let entry = format!(
+                    "[{now}] @{panicking_instance}: PANIC at {location}: {msg}\n{:?}\n",
+                    std::backtrace::Backtrace::capture(),
+                );
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/collab-worker-errors.log")
+                    .and_then(|mut f| f.write_all(entry.as_bytes()));
+                // Also print to stderr — useful when running from a terminal
+                // where the default hook would've printed anyway.
+                eprintln!("{entry}");
+            }));
+        }
+
         // Manifest resolution walks two paths in order:
         //   1. `.collab/team-managed` marker at cwd → load team.yml.
         //   2. `.collab/workers.json` manifest (legacy single-repo path).
