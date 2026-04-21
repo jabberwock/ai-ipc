@@ -618,8 +618,18 @@
       if (inner) inner.scrollTop = inner.scrollHeight;
       closeWorkerGlance();
     });
-    bind('glance-stop', () => {
-      toast('Per-worker stop isn\'t wired yet — use "Stop All" for now.', true);
+    bind('glance-stop', async () => {
+      if (!glanceOpenFor) return;
+      const target = glanceOpenFor;
+      if (!confirm(`Stop @${target}?\n\nThis kills the worker process. Pending todos stay on the server — they'll be picked up when the worker starts again.`)) return;
+      const stopBtn = document.getElementById('glance-stop');
+      if (stopBtn) { stopBtn.disabled = true; stopBtn.textContent = 'Stopping…'; }
+      const ok = await stopWorker(target);
+      if (stopBtn) {
+        stopBtn.disabled = false;
+        stopBtn.textContent = ok ? '✓ Stopped' : 'Stop';
+        if (ok) setTimeout(closeWorkerGlance, 800);
+      }
     });
 
     // Escape closes whichever floating panel is visible.

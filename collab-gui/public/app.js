@@ -1838,6 +1838,33 @@ async function doBroadcastStop() {
   await doStopWorkers();
 }
 
+// Stop a single worker via `collab stop @name`. Used by the worker-glance
+// drill-in. Returns a Promise so the caller can update UI after it lands.
+async function stopWorker(instanceId) {
+  if (!instanceId) return false;
+  const envs = [
+    ['COLLAB_TOKEN', cfg.token],
+    ['COLLAB_SERVER', cfg.serverUrl],
+    ['COLLAB_INSTANCE', cfg.identity || 'gui'],
+  ];
+  try {
+    await invoke('run_command', {
+      program: 'collab',
+      args:    ['stop', '@' + instanceId.replace(/^@/, '')],
+      cwd:     cfg.projectDir || undefined,
+      envs,
+    });
+    toast(`Stopped @${instanceId}`);
+    // Roster will catch up on the next poll; kick it now so the row
+    // flips to offline immediately instead of waiting 30s.
+    setTimeout(fetchRoster, 400);
+    return true;
+  } catch (e) {
+    toast(`Stop error: ${e}`, true);
+    return false;
+  }
+}
+
 // ── Presence heartbeat ────────────────────────────────────────────────────────
 async function registerPresence() {
   if (!cfg.identity) return;
