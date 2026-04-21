@@ -747,6 +747,50 @@ main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-hei
   transition: opacity .2s, transform .2s;
 }
 
+/* Recently-completed section — collapsed by default so the pending list
+   stays the visual focus. Expanded state is remembered across the 15s
+   fetchTodos poll via a data attribute on the list. */
+.todos-done {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.todos-done-summary {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .10em;
+  font-weight: 800;
+  color: var(--dim-text);
+  cursor: pointer;
+  padding: 4px 0 8px;
+  list-style: none;
+}
+.todos-done-summary::-webkit-details-marker { display: none; }
+.todos-done-summary::before {
+  content: '▸ ';
+  color: var(--dim);
+  font-weight: 400;
+  margin-right: 2px;
+  transition: transform var(--t);
+  display: inline-block;
+}
+.todos-done[open] .todos-done-summary::before { content: '▾ '; }
+.todos-done-summary:hover { color: var(--sub); }
+
+/* Completed rows — visibly-muted, strikethrough desc, no ✓ button. */
+.todo-item.done {
+  opacity: .6;
+  background: transparent;
+  border-style: dashed;
+}
+.todo-item.done .todo-desc {
+  text-decoration: line-through;
+  color: var(--dim-text);
+}
+.todo-item.done .todo-assignee {
+  color: var(--dim);
+}
+
 .todo-compose {
   border-bottom: 1px solid var(--border);
   padding: 8px;

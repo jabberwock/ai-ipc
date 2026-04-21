@@ -1187,7 +1187,12 @@ async function fetchTodos() {
     await Promise.all([...seen].map(async id => {
       if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return;
       try {
-        const res = await fetch(`${cfg.serverUrl}/todos/${id}`, {
+        // `include_completed=10` asks the server for up to 10 recently-
+        // completed todos per worker alongside the open ones. Needed so
+        // the GUI can show a "recently done" rail — otherwise workers'
+        // references to stale tickets in their prompt history have no
+        // visible counterpart for the human watching the dashboard.
+        const res = await fetch(`${cfg.serverUrl}/todos/${id}?include_completed=10`, {
           headers: { Authorization: `Bearer ${cfg.token}` },
         });
         if (!res.ok) return;
@@ -1195,7 +1200,16 @@ async function fetchTodos() {
         allTodos.push(...todos);
       } catch (_) {}
     }));
-    allTodos.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+    // Sort open (created_at asc) on top; completed (completed_at desc)
+    // below. Keeps the most-recently-closed stuff in eyeshot so the human
+    // can see what workers are referring back to.
+    allTodos.sort((a, b) => {
+      const aDone = !!a.completed_at;
+      const bDone = !!b.completed_at;
+      if (aDone !== bDone) return aDone ? 1 : -1;
+      if (!aDone) return new Date(a.created_at) - new Date(b.created_at);
+      return new Date(b.completed_at) - new Date(a.completed_at);
+    });
     renderTodos(allTodos);
   } catch (_) {}
 }
@@ -1204,52 +1218,88 @@ function renderTodos(todos) {
   const list  = document.getElementById('todos-list');
   const count = document.getElementById('todos-count');
   if (!list) return;
-  if (count) count.textContent = todos.length;
+
+  // Split into pending (what workers are supposed to be doing) and done
+  // (recently-completed). Only the pending count feeds the header badge —
+  // the done section is a read-only rail below.
+  const open = todos.filter(t => !t.completed_at);
+  const done = todos.filter(t => t.completed_at);
+  if (count) count.textContent = open.length;
+
   list.innerHTML = '';
-  if (todos.length === 0) {
+  if (open.length === 0 && done.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'todos-empty';
     empty.textContent = 'No pending tasks';
     list.appendChild(empty);
     return;
   }
-  todos.forEach(t => {
-    const div = document.createElement('div');
-    div.className = 'todo-item';
-    div.dataset.hash = t.hash || '';
 
-    const byLine = document.createElement('div');
-    byLine.className = 'todo-by';
-    const assignee = document.createElement('span');
-    assignee.className = 'todo-assignee';
-    assignee.textContent = '@' + (t.instance || '');
-    byLine.appendChild(assignee);
-    byLine.appendChild(document.createTextNode(' · from ' + (t.assigned_by || '') + ' · ' + timeAgo(t.created_at)));
+  open.forEach(t => list.appendChild(buildTodoItem(t, false)));
 
-    // ✓ button — marks the todo complete via PATCH /todos/:hash/done.
-    // Server treats "complete" as the only mutation (no separate delete),
-    // and a completed todo drops out of list_todos on the next fetch.
-    if (t.hash) {
-      const done = document.createElement('button');
-      done.className = 'todo-done';
-      done.title = 'Mark done — removes it from this worker\'s queue';
-      done.setAttribute('aria-label', 'Mark todo complete');
-      done.textContent = '✓';
-      done.addEventListener('click', (e) => {
-        e.stopPropagation();
-        markTodoDone(t.hash, div, done);
-      });
-      byLine.appendChild(done);
-    }
-    div.appendChild(byLine);
+  if (done.length > 0) {
+    const details = document.createElement('details');
+    details.className = 'todos-done';
+    // Remember the open/closed state across refreshes so the list doesn't
+    // collapse every 15s when fetchTodos repolls.
+    const wasOpen = list.dataset.doneOpen === '1';
+    if (wasOpen) details.open = true;
+    details.addEventListener('toggle', () => {
+      list.dataset.doneOpen = details.open ? '1' : '0';
+    });
 
-    const descLine = document.createElement('div');
-    descLine.className = 'todo-desc';
-    descLine.textContent = t.description || '';
-    div.appendChild(descLine);
+    const summary = document.createElement('summary');
+    summary.className = 'todos-done-summary';
+    summary.textContent = `Recently completed (${done.length})`;
+    details.appendChild(summary);
 
-    list.appendChild(div);
-  });
+    done.forEach(t => details.appendChild(buildTodoItem(t, true)));
+    list.appendChild(details);
+  }
+}
+
+// Build one .todo-item row. `isDone` styles it with a strikethrough and
+// hides the ✓ button (completed todos can't be re-completed).
+function buildTodoItem(t, isDone) {
+  const div = document.createElement('div');
+  div.className = 'todo-item' + (isDone ? ' done' : '');
+  div.dataset.hash = t.hash || '';
+
+  const byLine = document.createElement('div');
+  byLine.className = 'todo-by';
+  const assignee = document.createElement('span');
+  assignee.className = 'todo-assignee';
+  assignee.textContent = '@' + (t.instance || '');
+  byLine.appendChild(assignee);
+  const ts = isDone && t.completed_at
+    ? timeAgo(t.completed_at) + ' (done)'
+    : timeAgo(t.created_at);
+  byLine.appendChild(document.createTextNode(' · from ' + (t.assigned_by || '') + ' · ' + ts));
+
+  // ✓ button — marks the todo complete via PATCH /todos/:hash/done.
+  // Server treats "complete" as the only mutation (no separate delete),
+  // and a completed todo drops out of list_todos on the next fetch.
+  // Hidden for already-done rows.
+  if (t.hash && !isDone) {
+    const done = document.createElement('button');
+    done.className = 'todo-done';
+    done.title = 'Mark done — removes it from this worker\'s queue';
+    done.setAttribute('aria-label', 'Mark todo complete');
+    done.textContent = '✓';
+    done.addEventListener('click', (e) => {
+      e.stopPropagation();
+      markTodoDone(t.hash, div, done);
+    });
+    byLine.appendChild(done);
+  }
+  div.appendChild(byLine);
+
+  const descLine = document.createElement('div');
+  descLine.className = 'todo-desc';
+  descLine.textContent = t.description || '';
+  div.appendChild(descLine);
+
+  return div;
 }
 
 // Mark a todo complete. Optimistic: fade the row immediately so the click

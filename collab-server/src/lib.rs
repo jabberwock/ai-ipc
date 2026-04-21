@@ -1668,6 +1668,48 @@ async fn create_todo(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // Dedup pass. If an *open* todo with the same (instance, description,
+    // team_id) already exists, return it unchanged. No new row, no ping.
+    // Rationale: two workers (reviewer + rustydemon) watching the same
+    // codebase regularly notice the same bug and each file a ticket for it,
+    // so d4webdev ends up with two tickets to close. This catches the
+    // literal-same-description case (common with copy-paste retries and
+    // structured "📋" prompts). Semantic near-dup detection is a separate
+    // concern — see the companion PR discussion.
+    //
+    // Dedup ignores `assigned_by` on purpose: if reviewer already filed it,
+    // rustydemon's identical re-file is just noise regardless of sender.
+    //
+    // Only OPEN todos count — a completed todo of the same text being
+    // legitimately re-filed is treated as a new piece of work.
+    if let Some(existing) = sqlx::query(
+        r#"
+        SELECT id, hash, instance, assigned_by, description, created_at, completed_at
+        FROM todos
+        WHERE instance = ?
+          AND description = ?
+          AND completed_at IS NULL
+          AND COALESCE(team_id, '') = COALESCE(?, '')
+        ORDER BY created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(&payload.instance)
+    .bind(&payload.description)
+    .bind(auth.team_id.as_deref())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::error!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
+        let mut rows = vec![existing];
+        let mut todos = parse_todo_rows(std::mem::take(&mut rows));
+        if let Some(todo) = todos.pop() {
+            return Ok(Json(todo));
+        }
+    }
+
     let now = Utc::now();
     let now_iso = now.to_rfc3339();
 
@@ -1765,13 +1807,23 @@ async fn create_todo(
 async fn list_todos(
     Extension(auth): Extension<AuthContext>,
     Path(instance_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<Todo>>, StatusCode> {
     if instance_id.len() > MAX_INSTANCE_ID_LEN || !is_valid_identifier(&instance_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let rows = sqlx::query(
+    // `?include_completed=N` opts into returning up to N recently-completed
+    // todos alongside the open ones. Default N=0 (open-only, back-compat).
+    // Clamped to 50 so a bad client can't scan the whole history table.
+    let include_completed: usize = params
+        .get("include_completed")
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.min(50))
+        .unwrap_or(0);
+
+    let open_rows = sqlx::query(
         r#"
         SELECT id, hash, instance, assigned_by, description, created_at, completed_at
         FROM todos
@@ -1790,7 +1842,32 @@ async fn list_todos(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let todos = parse_todo_rows(rows);
+    let mut todos = parse_todo_rows(open_rows);
+
+    if include_completed > 0 {
+        let done_rows = sqlx::query(
+            r#"
+            SELECT id, hash, instance, assigned_by, description, created_at, completed_at
+            FROM todos
+            WHERE instance = ?
+              AND completed_at IS NOT NULL
+              AND COALESCE(team_id, '') = COALESCE(?, '')
+            ORDER BY completed_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(&instance_id)
+        .bind(auth.team_id.as_deref())
+        .bind(include_completed as i64)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        todos.extend(parse_todo_rows(done_rows));
+    }
+
     Ok(Json(todos))
 }
 
@@ -2361,5 +2438,130 @@ mod lease_tests {
         let app = app_with_team("team-a", "tok-a").await;
         let r = app.clone().oneshot(usage_post_req(Some("tok-a"), "builder", 1, 1, "heavy", None, None)).await.unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Todo dedup ───────────────────────────────────────────────────
+    // See the create_todo dedup comment: two workers watching the same
+    // codebase regularly notice the same bug and each file a ticket.
+    // Exact-description dedup folds those retries into one row so the
+    // assignee doesn't get two tickets to close for the same work.
+
+    fn todo_create_req(token: Option<&str>, instance: &str, assigned_by: &str, desc: &str) -> HttpRequest<Body> {
+        let body = serde_json::json!({
+            "instance": instance,
+            "assigned_by": assigned_by,
+            "description": desc,
+        });
+        let mut builder = HttpRequest::builder()
+            .method("POST")
+            .uri("/todos")
+            .header("content-type", "application/json");
+        if let Some(t) = token {
+            builder = builder.header("Authorization", format!("Bearer {}", t));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn todo_list_req(token: Option<&str>, instance: &str, include_completed: Option<usize>) -> HttpRequest<Body> {
+        let path = match include_completed {
+            Some(n) => format!("/todos/{}?include_completed={}", instance, n),
+            None => format!("/todos/{}", instance),
+        };
+        let mut builder = HttpRequest::builder().method("GET").uri(path);
+        if let Some(t) = token {
+            builder = builder.header("Authorization", format!("Bearer {}", t));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn todo_done_req(token: Option<&str>, hash: &str) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/todos/{}/done", hash));
+        if let Some(t) = token {
+            builder = builder.header("Authorization", format!("Bearer {}", t));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_todo_dedups_identical_description() {
+        let app = app_with_team("team-a", "tok-a").await;
+        let r1 = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "fix the map bug")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let t1: Todo = serde_json::from_slice(&body_bytes(r1).await).unwrap();
+
+        // Second call, same instance + description, different assigned_by —
+        // dedup ignores the sender, so it returns the first todo's hash.
+        let r2 = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "rustydemon", "fix the map bug")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let t2: Todo = serde_json::from_slice(&body_bytes(r2).await).unwrap();
+        assert_eq!(t1.hash, t2.hash, "identical descriptions must collapse to one hash");
+        assert_eq!(t1.assigned_by, t2.assigned_by, "returned todo should be the original");
+
+        // List shows exactly one pending todo.
+        let list = app.clone().oneshot(todo_list_req(Some("tok-a"), "d4webdev", None)).await.unwrap();
+        let todos: Vec<Todo> = serde_json::from_slice(&body_bytes(list).await).unwrap();
+        assert_eq!(todos.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_todo_different_description_creates_new_row() {
+        let app = app_with_team("team-a", "tok-a").await;
+        let _ = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "fix the map bug")).await.unwrap();
+        let _ = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "fix the gear rarity bug")).await.unwrap();
+        let list = app.clone().oneshot(todo_list_req(Some("tok-a"), "d4webdev", None)).await.unwrap();
+        let todos: Vec<Todo> = serde_json::from_slice(&body_bytes(list).await).unwrap();
+        assert_eq!(todos.len(), 2, "distinct descriptions must each create a row");
+    }
+
+    #[tokio::test]
+    async fn create_todo_same_description_after_completion_creates_new_row() {
+        // Dedup only considers OPEN todos. A legitimate re-file after
+        // completion (same text, genuinely new work) must not collapse.
+        let app = app_with_team("team-a", "tok-a").await;
+        let r1 = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "verify map renders")).await.unwrap();
+        let t1: Todo = serde_json::from_slice(&body_bytes(r1).await).unwrap();
+        let done = app.clone().oneshot(todo_done_req(Some("tok-a"), &t1.hash)).await.unwrap();
+        assert_eq!(done.status(), StatusCode::NO_CONTENT);
+
+        // Same description again, post-completion → new row, new hash.
+        let r2 = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "verify map renders")).await.unwrap();
+        let t2: Todo = serde_json::from_slice(&body_bytes(r2).await).unwrap();
+        assert_ne!(t1.hash, t2.hash, "re-file after completion is a new ticket");
+    }
+
+    #[tokio::test]
+    async fn list_todos_include_completed_returns_open_plus_done() {
+        let app = app_with_team("team-a", "tok-a").await;
+        let r1 = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "task one")).await.unwrap();
+        let t1: Todo = serde_json::from_slice(&body_bytes(r1).await).unwrap();
+        let _ = app.clone().oneshot(todo_done_req(Some("tok-a"), &t1.hash)).await.unwrap();
+        let _ = app.clone().oneshot(todo_create_req(Some("tok-a"), "d4webdev", "reviewer", "task two")).await.unwrap();
+
+        // Default: open only.
+        let open_only = app.clone().oneshot(todo_list_req(Some("tok-a"), "d4webdev", None)).await.unwrap();
+        let todos: Vec<Todo> = serde_json::from_slice(&body_bytes(open_only).await).unwrap();
+        assert_eq!(todos.len(), 1, "default should be open-only");
+        assert!(todos[0].completed_at.is_none());
+
+        // With include_completed=10: both.
+        let with_done = app.clone().oneshot(todo_list_req(Some("tok-a"), "d4webdev", Some(10))).await.unwrap();
+        let todos: Vec<Todo> = serde_json::from_slice(&body_bytes(with_done).await).unwrap();
+        assert_eq!(todos.len(), 2, "expected open + completed");
+        // Open first, then completed.
+        assert!(todos[0].completed_at.is_none(), "open todo first");
+        assert!(todos[1].completed_at.is_some(), "completed todo second");
+    }
+
+    #[tokio::test]
+    async fn list_todos_include_completed_clamps_at_50() {
+        // Claiming 9999 shouldn't let a client scan the whole table.
+        let app = app_with_team("team-a", "tok-a").await;
+        let r = app.clone().oneshot(todo_list_req(Some("tok-a"), "d4webdev", Some(9999))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        // No panic / no 500 is the assertion; actual behavior is internal
+        // clamp to 50, which is exercised by the query builder regardless
+        // of how many rows exist.
     }
 }
