@@ -257,6 +257,24 @@ impl WorkerHarness {
         self
     }
 
+    /// Broadcast FYIs (`recipient == "all"`) that don't @-mention this worker
+    /// and carry no task marker are informational — acting on them produces the
+    /// ack chorus where N workers each reply "noted" to a single human FYI.
+    /// Task markers (📋) and explicit @self mentions bypass the filter.
+    fn is_broadcast_fyi(&self, msg: &Message) -> bool {
+        if msg.recipient != "all" {
+            return false;
+        }
+        let me = format!("@{}", self.instance_id);
+        if msg.content.contains(&me) {
+            return false;
+        }
+        if msg.content.contains("📋") {
+            return false;
+        }
+        true
+    }
+
     /// Classify how much context a set of messages needs
     async fn classify_tier(&self, messages: &[Message]) -> PromptTier {
         // Ping/status checks → harness handles directly
@@ -278,6 +296,13 @@ impl WorkerHarness {
             return PromptTier::Harness;
         }
 
+        // Broadcast FYIs not addressed to this worker → harness-swallow.
+        // Prevents the ack chorus where one human broadcast triggers N "noted"
+        // replies from N workers.
+        if !non_self_msgs.is_empty() && non_self_msgs.iter().all(|m| self.is_broadcast_fyi(m)) {
+            return PromptTier::Harness;
+        }
+
         // Anything that isn't a ping or ack needs the full prompt: the
         // worker has to see its teammates, state, and todo list to do real
         // work. Token cost is kept in check by prompt caching on the static
@@ -286,7 +311,7 @@ impl WorkerHarness {
     }
 
     /// Handle harness-tier messages without spawning CLI.
-    /// Pings get a status reply; acks get swallowed silently to break ack loops.
+    /// Pings get a status reply; acks and broadcast-FYIs get swallowed silently.
     async fn handle_harness_tier(&self, messages: &[Message]) -> Result<()> {
         let ping_re = Regex::new(PING_PATTERN).unwrap();
         let is_ping = messages.iter().all(|m| ping_re.is_match(m.content.trim()));
@@ -313,14 +338,20 @@ impl WorkerHarness {
             }
             self.log(&format!("harness-handled ping → {}", status));
         } else {
-            // Ack messages — swallow silently to break ack loops
+            // Ack or broadcast-FYI — swallow silently. Both cases waste a CLI
+            // turn if propagated: acks create loops, FYIs create the N-worker
+            // "noted" chorus for a single human broadcast.
             let senders: Vec<_> = messages.iter()
                 .filter(|m| m.sender != self.instance_id)
                 .map(|m| format!("@{}", m.sender))
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter().collect();
-            self.log(&format!("swallowed {} ack(s) from {} — no CLI spawn",
-                messages.len(), senders.join(", ")));
+            let all_fyi = messages.iter()
+                .filter(|m| m.sender != self.instance_id)
+                .all(|m| self.is_broadcast_fyi(m));
+            let kind = if all_fyi { "broadcast-FYI" } else { "ack" };
+            self.log(&format!("swallowed {} {}(s) from {} — no CLI spawn",
+                messages.len(), kind, senders.join(", ")));
         }
         Ok(())
     }
@@ -1018,7 +1049,12 @@ Previous state:
 {history}New messages ({n}):
 {msg_lines}
 
-Act on the new messages above. Use Bash/Read/Write/Edit to do your actual work (coding, research, testing).",
+Priority order for this turn:
+1. If a new message @-mentions you or asks a direct question you alone can answer, reply and act on it.
+2. Otherwise, if you have pending tasks listed above, pick one and make progress. Do not chat about tasks — work them. Use Bash/Read/Write/Edit.
+3. If neither applies (broadcast FYI with nothing for you to do), set continue=false and stay silent. No acknowledgments.
+
+Never send a 'noted'/'understood'/'will do' reply. Either do the work now or stay silent.",
             instance_id = self.instance_id,
             role = self.get_role(),
             teammates = teammates_str,
@@ -2479,5 +2515,74 @@ mod integration {
         assert_eq!(to_reviewer.len(), 1, "expected exactly one, got: {:?}", to_reviewer);
         assert!(to_reviewer[0].contains("all good"));
         assert!(!to_reviewer[0].contains("Completed work from @"));
+    }
+
+    fn broadcast_from(sender: &str, content: &str) -> Message {
+        Message {
+            sender: sender.into(),
+            recipient: "all".into(),
+            content: content.into(),
+            hash: format!("bh-{}", content.len()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_tier_swallows_broadcast_fyi_not_addressed_to_me() {
+        // Exact shape from the D4LFG session: human posts an FYI to "all"
+        // with no @mention and no task marker. Old behavior: every worker
+        // wakes and replies "noted". New behavior: harness-swallow.
+        let id = unique_id("fyi-swallow");
+        let dir = TempDir::new().unwrap();
+        let fake = FakeApi::new();
+        let harness = make_harness("true {prompt}", dir.path(),
+            fake as Arc<dyn CollabApi>, &id);
+
+        let msg = broadcast_from("human",
+            "FYI rustydemon is the dataminer. They can provide you with assets etc.");
+        let tier = harness.classify_tier(&[msg]).await;
+        assert_eq!(tier, PromptTier::Harness);
+    }
+
+    #[tokio::test]
+    async fn classify_tier_wakes_on_broadcast_that_mentions_me() {
+        let id = "d4webdev";
+        let dir = TempDir::new().unwrap();
+        let fake = FakeApi::new();
+        let harness = make_harness("true {prompt}", dir.path(),
+            fake as Arc<dyn CollabApi>, id);
+
+        let msg = broadcast_from("human",
+            "@d4webdev can you take a look at the build page?");
+        let tier = harness.classify_tier(&[msg]).await;
+        assert_eq!(tier, PromptTier::Full);
+    }
+
+    #[tokio::test]
+    async fn classify_tier_wakes_on_broadcast_task_marker() {
+        let id = unique_id("task-marker");
+        let dir = TempDir::new().unwrap();
+        let fake = FakeApi::new();
+        let harness = make_harness("true {prompt}", dir.path(),
+            fake as Arc<dyn CollabApi>, &id);
+
+        let msg = broadcast_from("human",
+            "📋 Everyone pick up one of the leveling builds to verify.");
+        let tier = harness.classify_tier(&[msg]).await;
+        assert_eq!(tier, PromptTier::Full);
+    }
+
+    #[tokio::test]
+    async fn classify_tier_direct_dm_always_wakes() {
+        // DMs (recipient == our id) must always wake even if they look FYI-ish.
+        let id = unique_id("direct-dm");
+        let dir = TempDir::new().unwrap();
+        let fake = FakeApi::new();
+        let harness = make_harness("true {prompt}", dir.path(),
+            fake as Arc<dyn CollabApi>, &id);
+
+        let msg = user_msg("please summarize the state of the optimizer");
+        let tier = harness.classify_tier(&[msg]).await;
+        assert_eq!(tier, PromptTier::Full);
     }
 }

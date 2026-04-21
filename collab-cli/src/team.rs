@@ -265,6 +265,34 @@ impl TeamConfig {
             }
         }
 
+        // Cycle detection on the reports_to graph. A cycle means every
+        // completion auto-forwards to the next worker in the ring forever:
+        // A completes → B wakes → B completes → C wakes → … → A wakes.
+        // Self-loops are already rejected above; this catches length 2+.
+        for start in &cfg.workers {
+            if start.reports_to.is_none() {
+                continue;
+            }
+            let mut path: Vec<String> = vec![start.name.clone()];
+            let mut cur = start.name.as_str();
+            loop {
+                let Some(node) = cfg.workers.iter().find(|x| x.name == cur) else { break; };
+                let Some(next) = node.reports_to.as_deref() else { break; };
+                if path.iter().any(|p| p == next) {
+                    path.push(next.to_string());
+                    anyhow::bail!(
+                        "reports_to cycle detected: {}. \
+                         A cycle causes every completion to auto-forward forever — \
+                         worker A completes → B wakes → B completes → … → A wakes. \
+                         Break the ring by removing `reports_to` on whichever worker is terminal.",
+                        path.join(" → ")
+                    );
+                }
+                path.push(next.to_string());
+                cur = next;
+            }
+        }
+
         Ok(cfg)
     }
 
@@ -568,6 +596,71 @@ workers:
 "#;
         let err = TeamConfig::from_yaml(yaml).unwrap_err().to_string();
         assert!(err.contains("itself"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_two_node_reports_to_cycle() {
+        // Exact shape from D4LFG's original team.yml that produced the
+        // self-fueling verification loop: a↔b reports-to each other.
+        let yaml = r#"
+team: t
+workers:
+  - name: a
+    role: r
+    codebase_path: /a
+    reports_to: b
+  - name: b
+    role: r
+    codebase_path: /b
+    reports_to: a
+"#;
+        let err = TeamConfig::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("cycle"), "got: {}", err);
+        assert!(err.contains("a") && err.contains("b"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_three_node_reports_to_ring() {
+        // d4webdev → reviewer → rustydemon → d4webdev — the exact D4LFG ring.
+        let yaml = r#"
+team: t
+workers:
+  - name: d4webdev
+    role: r
+    codebase_path: /a
+    reports_to: reviewer
+  - name: reviewer
+    role: r
+    codebase_path: /b
+    reports_to: rustydemon
+  - name: rustydemon
+    role: r
+    codebase_path: /c
+    reports_to: d4webdev
+"#;
+        let err = TeamConfig::from_yaml(yaml).unwrap_err().to_string();
+        assert!(err.contains("cycle"), "got: {}", err);
+    }
+
+    #[test]
+    fn accepts_linear_reports_to_chain() {
+        // a → b → c (no cycle, c is terminal). Must not trigger cycle check.
+        let yaml = r#"
+team: t
+workers:
+  - name: a
+    role: r
+    codebase_path: /a
+    reports_to: b
+  - name: b
+    role: r
+    codebase_path: /b
+    reports_to: c
+  - name: c
+    role: r
+    codebase_path: /c
+"#;
+        TeamConfig::from_yaml(yaml).expect("linear chain should parse");
     }
 
     #[test]
