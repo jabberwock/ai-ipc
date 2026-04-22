@@ -49,12 +49,6 @@ pub struct WorkerConfig {
     pub hands_off_to: Vec<String>,
 }
 
-impl ProjectConfig {
-    pub fn new(server: String, output_dir: Option<String>, codebase_path: Option<String>, model: Option<String>, workers: Vec<WorkerConfig>) -> Self {
-        Self { server, output_dir, shared_data_dir: None, codebase_path, model, cli_template: None, workers }
-    }
-}
-
 pub fn run_from_yaml(yaml_path: &Path, output_dir_override: Option<&str>) -> Result<()> {
     let contents = std::fs::read_to_string(yaml_path)
         .map_err(|e| anyhow::anyhow!("Cannot read '{}': {}", yaml_path.display(), e))?;
