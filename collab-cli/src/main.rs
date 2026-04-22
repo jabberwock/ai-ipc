@@ -11,10 +11,6 @@ mod lifecycle;
 mod team;
 mod team_cli;
 mod team_init;
-#[cfg(feature = "monitor")]
-mod monitor;
-#[cfg(feature = "monitor")]
-mod wizard;
 
 use client::CollabClient;
 
@@ -359,14 +355,6 @@ enum Commands {
     /// processes on this machine, use `collab ps`.
     Roster,
 
-    /// Live TUI monitor showing roster and message activity (requires --features monitor)
-    #[cfg(feature = "monitor")]
-    Monitor {
-        /// Refresh interval in seconds (default: 2)
-        #[arg(short, long, default_value = "2")]
-        interval: u64,
-    },
-
     /// Print the path to the config file
     ConfigPath,
 
@@ -520,20 +508,9 @@ async fn main() -> Result<()> {
                 }
             }
             None => {
-                #[cfg(feature = "monitor")]
-                {
-                    match wizard::run()? {
-                        Some(config) => init::generate(&config, output.as_deref())?,
-                        None => println!("Wizard cancelled."),
-                    }
-                }
-                #[cfg(not(feature = "monitor"))]
-                {
-                    anyhow::bail!(
-                        "Interactive wizard requires the 'monitor' feature.\n\
-                         Provide a YAML file instead: collab init workers.yaml"
-                    );
-                }
+                anyhow::bail!(
+                    "collab init requires a YAML file: collab init workers.yaml"
+                );
             }
         }
         return Ok(());
@@ -923,17 +900,6 @@ async fn main() -> Result<()> {
                 client.todo_done(&hash).await?;
             }
         },
-        #[cfg(feature = "monitor")]
-        Commands::Monitor { interval } => {
-            let server2 = server.clone();
-            let instance2 = instance_id.clone();
-            let token2 = token.clone();
-            std::thread::spawn(move || {
-                monitor::run(&server2, &instance2, interval, token2.as_deref())
-            })
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("monitor panicked")))?;
-        }
         Commands::Roster | Commands::ConfigPath | Commands::Usage | Commands::Init { .. }
         | Commands::Start { .. } | Commands::Stop { .. } | Commands::Restart { .. }
         | Commands::Ps | Commands::Team { .. } | Commands::Whoami

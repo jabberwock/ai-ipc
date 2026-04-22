@@ -264,9 +264,6 @@ collab start @frontend                  # start one worker
 collab stop all                         # stop all workers (kills child processes too)
 collab restart @backend                 # restart one worker
 collab lifecycle-status                 # show running workers and PIDs
-
-# Monitor (human-facing TUI)
-collab monitor                          # live roster + message activity
 ```
 
 The `@` prefix is optional — `@agent` and `agent` are the same. Flags like `--instance` and `--server` work before or after the subcommand.
