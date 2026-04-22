@@ -183,7 +183,7 @@
           <div class="glance-output" id="glance-output"></div>
           <div class="glance-tail">
             <span class="glance-tail-dot"></span>
-            <span class="glance-tail-label">tail -f · mocked</span>
+            <span class="glance-tail-label">tail -f · not yet wired</span>
             <div class="feed-spacer"></div>
             <button class="btn btn-ghost btn-xs" id="glance-open-log">full log →</button>
           </div>
@@ -342,50 +342,40 @@
     };
   }
 
-  function _mockGlance(workerName, liveRole) {
-    const rnd = _hashSeed(workerName || 'worker');
-    const ages = ['3s', '11s', '42s', '2m', '6m'];
-    const pidPool = [24123, 31780, 42981, 69027, 77125, 88432];
-    const fileStems = [
-      'src/app.js', 'src/index.ts', 'public/styles.css',
-      'tests/smoke.spec.mjs', 'README.md', 'docs/howto.md', 'build.sh',
-    ];
-    const tagPool = ['M', 'M', 'A', 'M', '?'];
-    const gitCount = Math.floor(rnd() * 4) + 2;
-    const gitChanges = [];
-    for (let i = 0; i < gitCount; i++) {
-      const tag = tagPool[Math.floor(rnd() * tagPool.length)];
-      gitChanges.push({
-        tag,
-        path: fileStems[Math.floor(rnd() * fileStems.length)],
-        plus:  tag === 'D' ? 0 : Math.floor(rnd() * 40) + 1,
-        minus: tag === 'A' ? 0 : Math.floor(rnd() * 15),
-      });
-    }
-    const activity = Array.from({ length: 30 }, () => Math.floor(rnd() * 11));
-    for (let i = 27; i < 30; i++) activity[i] = Math.floor(rnd() * 8) + 4;
+  async function _fetchUsageFor(workerName) {
+    if (!cfg || !cfg.serverUrl) return null;
+    try {
+      const url = cfg.serverUrl.replace(/\/+$/, '') + '/usage';
+      const headers = cfg.token ? { Authorization: 'Bearer ' + cfg.token } : {};
+      const res = await fetch(url, { headers });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const row = (data.workers || []).find(w => w.worker === workerName);
+      return row || null;
+    } catch { return null; }
+  }
 
+  // Skeleton glance with real fields where we have a wired endpoint and clear
+  // placeholders everywhere else. Previously this function fabricated cost,
+  // calls, PID, cwd, branch, git changes, activity sparkline, and the output
+  // log from a seeded hash of the worker's name — deterministic but fake. That
+  // made the modal look functional when only the roster name + todos were
+  // real. Everything un-wired now shows "—" / "not yet wired" instead.
+  function _glanceSkeleton(workerName, liveRole) {
     return {
       name: workerName,
       role: liveRole || 'Worker',
-      pid: pidPool[Math.floor(rnd() * pidPool.length)],
+      pid: null,
       state: 'working',
-      cwd: `~/code/${workerName}`,
-      branch: `work/${workerName}`,
-      lastOutputAge: ages[Math.floor(rnd() * ages.length)],
-      cost: '$' + (0.5 + rnd() * 9.5).toFixed(4),
-      calls: Math.floor(rnd() * 40) + 6,
-      output: [
-        { t: '16:21:03', text: `read_file('${fileStems[0]}') – ${Math.floor(rnd()*500)+80} lines` },
-        { t: '16:21:08', text: `Applied edit to ${fileStems[1]} (+${Math.floor(rnd()*12)+1}, -${Math.floor(rnd()*5)})` },
-        { t: '16:21:14', text: `✓ Working on task; rerunning checks.` },
-      ],
-      gitChanges,
-      diffStat: {
-        add: gitChanges.reduce((s, g) => s + (g.plus  || 0), 0),
-        del: gitChanges.reduce((s, g) => s + (g.minus || 0), 0),
-      },
-      activity,
+      cwd: null,
+      branch: null,
+      lastOutputAge: null,
+      cost: null,
+      calls: null,
+      output: [],
+      gitChanges: [],
+      diffStat: { add: 0, del: 0 },
+      activity: [],
       todos: { done: [], open: [] },
     };
   }
@@ -413,10 +403,10 @@
     return { done: [], open };
   }
 
-  function openWorkerGlance(workerName, workerRole) {
+  async function openWorkerGlance(workerName, workerRole) {
     if (!workerName) return;
     glanceOpenFor = workerName;
-    const g = _mockGlance(workerName, workerRole);
+    const g = _glanceSkeleton(workerName, workerRole);
     g.todos = _todosForWorkerFromDom(workerName);
     renderWorkerGlance(g);
     const p = document.getElementById('worker-glance');
@@ -426,6 +416,14 @@
     document.querySelectorAll('.roster-item').forEach(el => {
       el.classList.toggle('active', el.dataset.worker === workerName);
     });
+
+    // Overlay real /usage data once it lands. Guard on glanceOpenFor so
+    // a fast-close-then-click-another doesn't paint stale values.
+    const usage = await _fetchUsageFor(workerName);
+    if (glanceOpenFor !== workerName || !usage) return;
+    g.cost = usage.cost_usd;
+    g.calls = usage.calls;
+    renderWorkerGlance(g);
   }
 
   function closeWorkerGlance() {
@@ -441,15 +439,15 @@
     if (avatar) avatar.textContent = (g.name[0] || '?').toUpperCase();
     set('glance-name', g.name);
     set('glance-role', g.role);
-    set('glance-pid',  'PID ' + g.pid);
-    set('glance-cwd',  g.cwd);
-    set('glance-last-age', g.lastOutputAge);
-    set('glance-last-sub', 'since last output');
-    set('glance-uncommitted', String(g.gitChanges.length));
-    set('glance-cost', g.cost);
-    set('glance-calls', g.calls + ' calls');
-    set('glance-output-hint', 'from claude · ' + g.lastOutputAge);
-    set('glance-git-hint', `${g.branch} · +${g.diffStat.add} −${g.diffStat.del}`);
+    set('glance-pid',  g.pid != null ? 'PID ' + g.pid : 'PID —');
+    set('glance-cwd',  g.cwd || '—');
+    set('glance-last-age', g.lastOutputAge || '—');
+    set('glance-last-sub', g.lastOutputAge ? 'since last output' : 'not yet wired');
+    set('glance-uncommitted', g.gitChanges.length ? String(g.gitChanges.length) : '—');
+    set('glance-cost', g.cost != null ? '$' + Number(g.cost).toFixed(4) : '—');
+    set('glance-calls', g.calls != null ? g.calls + ' call' + (g.calls === 1 ? '' : 's') : '—');
+    set('glance-output-hint', g.lastOutputAge ? 'from claude · ' + g.lastOutputAge : 'not yet wired');
+    set('glance-git-hint', g.branch ? `${g.branch} · +${g.diffStat.add} −${g.diffStat.del}` : 'not yet wired');
 
     const state = document.getElementById('glance-state');
     if (state) {
@@ -462,6 +460,12 @@
     const out = document.getElementById('glance-output');
     if (out) {
       out.innerHTML = '';
+      if (!g.output.length) {
+        const empty = document.createElement('div');
+        empty.className = 'glance-output-line dim';
+        empty.textContent = 'Output streaming not yet wired to backend.';
+        out.appendChild(empty);
+      }
       g.output.forEach(line => {
         const row = document.createElement('div');
         row.className = 'glance-output-line';
@@ -479,6 +483,12 @@
     const gl = document.getElementById('glance-git-list');
     if (gl) {
       gl.innerHTML = '';
+      if (!g.gitChanges.length) {
+        const empty = document.createElement('div');
+        empty.className = 'glance-git-row dim';
+        empty.textContent = 'Git status not yet wired to backend.';
+        gl.appendChild(empty);
+      }
       g.gitChanges.forEach(f => {
         const row = document.createElement('div');
         row.className = 'glance-git-row';
@@ -570,15 +580,22 @@
     const spark = document.getElementById('glance-sparkline');
     if (spark) {
       spark.innerHTML = '';
-      const max = Math.max(...g.activity, 1);
-      g.activity.forEach((v, i) => {
-        const bar = document.createElement('div');
-        const h = Math.max(2, (v / max) * 100);
-        bar.className = 'glance-spark-bar'
-          + (v === 0 ? ' empty' : (i >= g.activity.length - 3 ? ' active' : ''));
-        bar.style.height = h + '%';
-        spark.appendChild(bar);
-      });
+      if (!g.activity.length) {
+        const empty = document.createElement('div');
+        empty.className = 'glance-spark-empty';
+        empty.textContent = 'not yet wired';
+        spark.appendChild(empty);
+      } else {
+        const max = Math.max(...g.activity, 1);
+        g.activity.forEach((v, i) => {
+          const bar = document.createElement('div');
+          const h = Math.max(2, (v / max) * 100);
+          bar.className = 'glance-spark-bar'
+            + (v === 0 ? ' empty' : (i >= g.activity.length - 3 ? ' active' : ''));
+          bar.style.height = h + '%';
+          spark.appendChild(bar);
+        });
+      }
     }
   }
 
