@@ -1930,19 +1930,39 @@ async fn complete_todo(
     }
 }
 
+/// Parse a timestamp column that might be stored in either RFC3339
+/// (`2026-04-21T00:11:30Z`, the format our writers emit) OR SQLite's
+/// default `YYYY-MM-DD HH:MM:SS` from a raw SQL `UPDATE` or pre-existing
+/// data written by an older path. Both are UTC in this schema.
+///
+/// We hit the mixed-format case when 9 completed todos in a live DB came
+/// back with `completed_at: null` in the JSON because the RFC3339-only
+/// parser dropped the value — the GUI then rendered them as "open" with
+/// a ✓ button, and clicking it returned 409 because the SQL update's
+/// `WHERE completed_at IS NULL` never matched the real (non-null) value.
+fn parse_flexible_utc(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        return Some(naive.and_utc());
+    }
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(naive.and_utc());
+    }
+    None
+}
+
 fn parse_todo_rows(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Todo> {
     rows.into_iter()
         .filter_map(|row| {
             let created_str: String = row.get("created_at");
-            let created_at = DateTime::parse_from_rfc3339(&created_str)
-                .ok()?
-                .with_timezone(&Utc);
+            let created_at = parse_flexible_utc(&created_str)?;
 
             let completed_at = row.try_get::<Option<String>, _>("completed_at")
                 .ok()
                 .flatten()
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|dt| dt.with_timezone(&Utc));
+                .and_then(|s| parse_flexible_utc(&s));
 
             Some(Todo {
                 id: row.get("id"),
@@ -2563,5 +2583,30 @@ mod lease_tests {
         // No panic / no 500 is the assertion; actual behavior is internal
         // clamp to 50, which is exercised by the query builder regardless
         // of how many rows exist.
+    }
+
+    #[test]
+    fn parse_flexible_utc_accepts_rfc3339_and_sqlite_default() {
+        // RFC3339 (what our writers emit).
+        let a = parse_flexible_utc("2026-04-21T00:11:30Z").expect("rfc3339");
+        assert_eq!(a.to_rfc3339(), "2026-04-21T00:11:30+00:00");
+
+        // RFC3339 with fractional seconds + explicit offset.
+        let b = parse_flexible_utc("2026-04-20T20:20:41.765312+00:00").expect("rfc3339 fractional");
+        assert_eq!(b.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-04-20 20:20:41");
+
+        // SQLite default — the exact shape of the 9 stale D4LFG rows that
+        // were ghosting as open todos in the GUI because the RFC3339-only
+        // parser returned None.
+        let c = parse_flexible_utc("2026-04-20 20:20:41").expect("sqlite default");
+        assert_eq!(c.to_rfc3339(), "2026-04-20T20:20:41+00:00");
+
+        // SQLite default with fractional seconds.
+        let d = parse_flexible_utc("2026-04-20 20:20:41.123").expect("sqlite fractional");
+        assert_eq!(d.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-04-20 20:20:41");
+
+        // Garbage stays None.
+        assert!(parse_flexible_utc("not a date").is_none());
+        assert!(parse_flexible_utc("").is_none());
     }
 }
